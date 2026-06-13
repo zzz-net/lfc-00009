@@ -111,10 +111,26 @@ class Storage:
         self.conn.commit()
 
     def _migrate_tables(self):
-        self._migrate_unique_constraint("enrollments", ["phone", "session"])
-        self._migrate_unique_constraint("signins", ["phone", "session", "scan_time"])
+        self._ensure_import_errors_table()
+        dropped_enroll = self._migrate_unique_constraint("enrollments", ["phone", "session"])
+        dropped_signin = self._migrate_unique_constraint("signins", ["phone", "session", "scan_time"])
+        if dropped_enroll or dropped_signin:
+            self.conn.commit()
 
-    def _migrate_unique_constraint(self, table: str, unique_cols: List[str]):
+    def _ensure_import_errors_table(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS import_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_file TEXT,
+                row_number INTEGER NOT NULL,
+                error_type TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                raw_data TEXT
+            )
+        """)
+
+    def _migrate_unique_constraint(self, table: str, unique_cols: List[str]) -> int:
         cur = self.conn.execute(f"PRAGMA index_list({table})")
         has_unique = False
         for idx in cur.fetchall():
@@ -122,22 +138,84 @@ class Storage:
                 has_unique = True
                 break
         if has_unique:
-            return
+            return 0
+
         cols_sql = ",".join(unique_cols)
         tmp_table = f"{table}_tmp"
         cur = self.conn.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'")
         row = cur.fetchone()
         if row is None:
-            return
+            return 0
         old_sql = row["sql"]
         new_sql = old_sql.rstrip(")") + f", UNIQUE({cols_sql}))"
+
         cur = self.conn.execute(f"PRAGMA table_info({table})")
         col_names = [r["name"] for r in cur.fetchall()]
         cols_csv = ",".join(col_names)
-        self.conn.execute(f"ALTER TABLE {table} RENAME TO {tmp_table}")
+
+        cur = self.conn.execute(f"SELECT COUNT(*) as c FROM {table}")
+        total_before = cur.fetchone()["c"]
+        if total_before == 0:
+            self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            self.conn.execute(new_sql)
+            return 0
+
+        group_cols = ",".join(unique_cols)
+
+        try:
+            self.conn.execute(f"ALTER TABLE {table} RENAME TO {tmp_table}")
+        except Exception:
+            return 0
+
         self.conn.execute(new_sql)
-        self.conn.execute(f"INSERT INTO {table} ({cols_csv}) SELECT {cols_csv} FROM {tmp_table}")
+
+        self.conn.execute(f"""
+            INSERT INTO {table} ({cols_csv})
+            SELECT t.{cols_csv.replace(',', ',t.')}
+            FROM {tmp_table} t
+            WHERE t.id IN (
+                SELECT MIN(id) FROM {tmp_table}
+                GROUP BY {group_cols}
+            )
+        """)
+
+        cur = self.conn.execute(f"SELECT COUNT(*) as c FROM {table}")
+        total_after = cur.fetchone()["c"]
+        dropped_count = total_before - total_after
+
+        if dropped_count > 0:
+            cur = self.conn.execute(f"""
+                SELECT t.* FROM {tmp_table} t
+                WHERE t.id NOT IN (
+                    SELECT MIN(id) FROM {tmp_table}
+                    GROUP BY {group_cols}
+                )
+            """)
+            duplicate_rows = cur.fetchall()
+            for dup in duplicate_rows:
+                dup_dict = dict(dup)
+                raw = json.dumps({k: v for k, v in dup_dict.items() if v}, ensure_ascii=False)
+                key_vals = ", ".join(f"{c}={dup_dict.get(c, '')!r}" for c in unique_cols)
+                matched_keep_id = self.conn.execute(f"""
+                    SELECT MIN(id) as keep_id FROM {tmp_table}
+                    WHERE {' AND '.join(f'{c}=?' for c in unique_cols)}
+                """, tuple(dup_dict.get(c) for c in unique_cols)).fetchone()
+                keep_id = matched_keep_id["keep_id"] if matched_keep_id else "?"
+                message = f"迁移去重：{table} 表重复记录 ({key_vals})，已丢弃 ID={dup_dict.get('id')}，保留 ID={keep_id}"
+                self.conn.execute(
+                    "INSERT INTO import_errors (source_type,source_file,row_number,error_type,error_message,raw_data) VALUES (?,?,?,?,?,?)",
+                    (
+                        f"migration_{table}",
+                        dup_dict.get("source_file") or "",
+                        dup_dict.get("source_row") or 0,
+                        "duplicate_dropped",
+                        message,
+                        raw,
+                    ),
+                )
+
         self.conn.execute(f"DROP TABLE {tmp_table}")
+        return dropped_count
 
     def close(self):
         self.conn.close()

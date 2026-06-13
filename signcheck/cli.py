@@ -400,6 +400,17 @@ def do_status():
     click.echo(f"撤销历史: {stats['undo_count']} 步")
     click.echo(f"导入错误: {stats['error_count']} 条")
 
+    if stats['error_count'] > 0:
+        errors = storage.get_all_import_errors()
+        migration_errors = [e for e in errors if e.source_type.startswith("migration_")]
+        if migration_errors:
+            enroll_dropped = sum(1 for e in migration_errors if e.source_type == "migration_enrollments")
+            signin_dropped = sum(1 for e in migration_errors if e.source_type == "migration_signins")
+            if enroll_dropped:
+                click.echo(f"  （迁移时去重丢弃报名重复记录 {enroll_dropped} 条，详见 errors 命令）")
+            if signin_dropped:
+                click.echo(f"  （迁移时去重丢弃签到重复记录 {signin_dropped} 条，详见 errors 命令）")
+
     storage.close()
 
 

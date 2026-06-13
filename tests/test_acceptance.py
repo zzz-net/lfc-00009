@@ -369,6 +369,200 @@ def test_import_bom_json():
         ctx.cleanup()
 
 
+def _create_old_schema_db(db_path: str):
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS enrollments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            session TEXT NOT NULL,
+            source_file TEXT,
+            source_row INTEGER,
+            imported_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            session TEXT NOT NULL,
+            scan_time TEXT,
+            source_file TEXT,
+            source_row INTEGER,
+            imported_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            field_name TEXT NOT NULL,
+            match_type TEXT NOT NULL DEFAULT 'exact',
+            threshold REAL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            imported_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS field_mapping (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mapping_type TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            csv_column TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reconcile_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            enroll_id INTEGER,
+            signin_id INTEGER,
+            name TEXT NOT NULL,
+            phone TEXT,
+            session TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manual_mark TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS undo_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            action_data TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS import_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            source_file TEXT,
+            row_number INTEGER NOT NULL,
+            error_type TEXT NOT NULL,
+            error_message TEXT NOT NULL,
+            raw_data TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _verify_no_unique_constraint(conn: sqlite3.Connection, table: str):
+    cur = conn.execute(f"PRAGMA index_list({table})")
+    for idx in cur.fetchall():
+        assert idx["origin"] != "u", f"Old schema should not have UNIQUE constraint on {table}"
+
+
+def test_old_db_migration_with_duplicates():
+    print("\n=== Test 8: Old DB migration with duplicate enrollments ===")
+    ctx = TestContext()
+    try:
+        db_path = ctx.get_db_path()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        conn = _create_old_schema_db(db_path)
+
+        _verify_no_unique_constraint(conn, "enrollments")
+        _verify_no_unique_constraint(conn, "signins")
+
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("张三", "13800001111", "上午场", "enroll.csv", 2, "2025-01-01T09:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("张三", "13800001111", "上午场", "enroll.csv", 2, "2025-01-01T09:05:00"),
+        )
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("张三", "13800001111", "上午场", "enroll.csv", 2, "2025-01-01T09:10:00"),
+        )
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("李四", "13800002222", "上午场", "enroll.csv", 3, "2025-01-01T09:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("李四", "13800002222", "上午场", "enroll.csv", 3, "2025-01-01T09:06:00"),
+        )
+        conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            ("王五", "13800003333", "下午场", "enroll.csv", 4, "2025-01-01T09:00:00"),
+        )
+
+        conn.execute(
+            "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
+            ("张三", "13800001111", "上午场", "09:01:15", "signin.csv", 2, "2025-01-01T10:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
+            ("张三", "13800001111", "上午场", "09:01:15", "signin.csv", 2, "2025-01-01T10:01:00"),
+        )
+        conn.execute(
+            "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
+            ("李四", "13800002222", "上午场", "09:05:40", "signin.csv", 3, "2025-01-01T10:00:00"),
+        )
+
+        cur = conn.execute("SELECT COUNT(*) as c FROM enrollments")
+        assert cur.fetchone()["c"] == 6, f"Expected 6 enrollments before migration"
+        cur = conn.execute("SELECT COUNT(*) as c FROM signins")
+        assert cur.fetchone()["c"] == 3, f"Expected 3 signins before migration"
+        conn.commit()
+        conn.close()
+
+        r = ctx.run(["status"])
+        assert r.returncode == 0, f"Status command should not crash on dirty old DB: {r.stderr}"
+        assert "8" not in r.stdout, f"Should not have 8 enrollments after dedup: {r.stdout}"
+
+        errors = ctx.db_execute("SELECT * FROM import_errors WHERE source_type LIKE 'migration_%'")
+        assert len(errors) >= 4, f"Should have at least 4 migration dedup errors (3 enroll + 1 signin): {len(errors)}"
+
+        enroll_count = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
+        signin_count = ctx.db_execute("SELECT COUNT(*) as c FROM signins")[0]["c"]
+        assert enroll_count == 3, f"Expected 3 unique enrollments after dedup, got {enroll_count}"
+        assert signin_count == 2, f"Expected 2 unique signins after dedup, got {signin_count}"
+
+        enroll_path = ctx.copy_sample("enroll.csv")
+        rules_path = ctx.copy_sample("rules.json")
+
+        r = ctx.run(["import-enroll", enroll_path])
+        assert r.returncode == 0, f"import-enroll should not crash after migration: {r.stderr}"
+        assert "跳过 3" in r.stdout, f"Should skip 3 existing enrollments: {r.stdout}"
+
+        ctx.run(["import-rules", rules_path])
+
+        signin_path = ctx.copy_sample("signin.csv")
+        r = ctx.run(["import-signin", signin_path])
+        assert r.returncode == 0, f"import-signin should not crash after migration: {r.stderr}"
+
+        r = ctx.run(["reconcile"])
+        assert r.returncode == 0, f"reconcile should not crash after migration: {r.stderr}"
+
+        output_path = os.path.join(ctx.tmpdir, "result.csv")
+        r = ctx.run(["export", "--output", output_path])
+        assert r.returncode == 0, f"export should not crash after migration: {r.stderr}"
+        rows = read_export_csv(output_path)
+        assert len(rows) > 0, f"Export should produce rows: {len(rows)}"
+
+        r = ctx.run(["errors"])
+        assert r.returncode == 0, f"errors command should not crash: {r.stderr}"
+        assert "migration" in r.stdout, f"Should show migration dedup errors: {r.stdout}"
+
+        print(f"  Before dedup: enroll=6, signin=3")
+        print(f"  After dedup: enroll={enroll_count}, signin={signin_count}")
+        print(f"  Migration errors logged: {len(errors)}")
+        print(f"  Reconcile/Export rows: {len(rows)}")
+        print("  [PASS] Old DB migration with duplicates")
+
+    finally:
+        ctx.cleanup()
+
+
 if __name__ == "__main__":
     os.chdir(os.path.dirname(__file__) + "/..")
     print("Running acceptance tests...")
@@ -379,4 +573,5 @@ if __name__ == "__main__":
     test_undo_import()
     test_import_idempotency()
     test_import_bom_json()
+    test_old_db_migration_with_duplicates()
     print("\n[OK] All acceptance tests passed!")
