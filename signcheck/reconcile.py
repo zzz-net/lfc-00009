@@ -180,6 +180,16 @@ def undo(storage: Storage) -> Optional[str]:
         storage.update_reconcile_result_mark(result_id, prev_mark, prev_notes)
         return f"mark: 已撤销结果 #{result_id} 的标记"
 
+    elif action_type == "batch_mark":
+        prev_states = data.get("prev_states", [])
+        for state in prev_states:
+            storage.update_reconcile_result_mark(
+                state["result_id"],
+                state.get("prev_manual_mark"),
+                state.get("prev_notes"),
+            )
+        return f"batch_mark: 已撤销 {len(prev_states)} 条批量标记"
+
     return None
 
 
@@ -201,3 +211,64 @@ def mark_result(storage: Storage, result_id: int, manual_mark: Optional[str], no
     storage.update_reconcile_result_mark(result_id, manual_mark, notes)
 
     return f"已标记结果 #{result_id} 为「{manual_mark}」"
+
+
+def batch_mark(storage: Storage, rows: List[dict]) -> tuple:
+    REQUIRED_HEADERS = {"result_id", "mark_text"}
+    errors: List[dict] = []
+    seen_ids: Dict[int, int] = {}
+
+    for idx, row in enumerate(rows):
+        csv_row = idx + 2
+        raw_id = row.get("result_id", "").strip()
+        mark_text = row.get("mark_text", "").strip()
+        notes = row.get("notes", "").strip()
+
+        if not raw_id:
+            errors.append({"row": csv_row, "error": "empty_result_id", "message": f"第 {csv_row} 行：result_id 不能为空"})
+            continue
+
+        try:
+            result_id = int(raw_id)
+        except (ValueError, TypeError):
+            errors.append({"row": csv_row, "error": "invalid_result_id", "message": f"第 {csv_row} 行：result_id「{raw_id}」不是有效整数"})
+            continue
+
+        if result_id in seen_ids:
+            errors.append({
+                "row": csv_row,
+                "error": "duplicate_result_id",
+                "message": f"第 {csv_row} 行：result_id={result_id} 与第 {seen_ids[result_id]} 行重复",
+            })
+            continue
+        seen_ids[result_id] = csv_row
+
+        if not mark_text:
+            errors.append({"row": csv_row, "error": "empty_mark", "message": f"第 {csv_row} 行：mark_text 不能为空"})
+            continue
+
+        existing = storage.get_reconcile_result_by_id(result_id)
+        if existing is None:
+            errors.append({"row": csv_row, "error": "not_found", "message": f"第 {csv_row} 行：结果 #{result_id} 不存在"})
+            continue
+
+    if errors:
+        return [], errors
+
+    prev_states: List[dict] = []
+    for row in rows:
+        result_id = int(row["result_id"].strip())
+        mark_text = row["mark_text"].strip()
+        notes = row.get("notes", "").strip()
+        existing = storage.get_reconcile_result_by_id(result_id)
+        prev_states.append({
+            "result_id": result_id,
+            "prev_manual_mark": existing.manual_mark,
+            "prev_notes": existing.notes,
+        })
+        storage.update_reconcile_result_mark(result_id, mark_text, notes if notes else None)
+
+    undo_data = json.dumps({"action": "batch_mark", "prev_states": prev_states}, ensure_ascii=False)
+    storage.add_undo_action("batch_mark", undo_data)
+
+    return prev_states, errors

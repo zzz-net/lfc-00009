@@ -13,7 +13,7 @@ from .models import (
     ImportErrorRecord,
 )
 from .storage import Storage
-from .reconcile import reconcile, undo, mark_result
+from .reconcile import reconcile, undo, mark_result, batch_mark
 
 
 def _get_storage() -> Storage:
@@ -320,6 +320,41 @@ def do_undo():
         click.echo("没有可撤销的操作")
     else:
         click.echo(f"[OK] 已撤销上一步操作：{msg}")
+    storage.close()
+
+
+@main.command("batch-mark")
+@click.argument("csv_file")
+def do_batch_mark(csv_file: str):
+    """批量导入人工复核标记（CSV 格式：result_id, mark_text, notes）"""
+    storage = _get_storage()
+    rows, abs_path = _read_csv(csv_file)
+
+    if not rows:
+        click.echo("错误：CSV 文件为空", err=True)
+        storage.close()
+        sys.exit(1)
+
+    headers = set(rows[0].keys())
+    required = {"result_id", "mark_text"}
+    missing = required - headers
+    if missing:
+        click.echo(f"错误：CSV 表头缺失必填列：{', '.join(sorted(missing))}", err=True)
+        click.echo(f"  当前表头：{', '.join(rows[0].keys())}", err=True)
+        click.echo(f"  必须包含：result_id, mark_text（notes 为可选列）", err=True)
+        storage.close()
+        sys.exit(1)
+
+    prev_states, errors = batch_mark(storage, rows)
+
+    if errors:
+        click.echo(f"错误：校验未通过，共 {len(errors)} 个问题，未写入任何数据：", err=True)
+        for e in errors:
+            click.echo(f"  [ERR] {e['message']}", err=True)
+        storage.close()
+        sys.exit(1)
+
+    click.echo(f"[OK] 成功导入 {len(prev_states)} 条人工标记")
     storage.close()
 
 

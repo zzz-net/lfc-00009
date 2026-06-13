@@ -563,6 +563,363 @@ def test_old_db_migration_with_duplicates():
         ctx.cleanup()
 
 
+def _setup_reconciled_data(ctx):
+    enroll_path = ctx.copy_sample("enroll.csv")
+    signin_path = ctx.copy_sample("signin.csv")
+    rules_path = ctx.copy_sample("rules.json")
+    ctx.run(["import-enroll", enroll_path])
+    ctx.run(["import-signin", signin_path])
+    ctx.run(["import-rules", rules_path])
+    ctx.run(["reconcile"])
+
+
+def _write_csv(tmpdir, filename, header, rows):
+    path = os.path.join(tmpdir, filename)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow(row)
+    return path
+
+
+def test_batch_mark_happy_path():
+    print("\n=== Test 9: batch-mark happy path ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        results = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results ORDER BY id")
+        result_ids = [r["id"] for r in results]
+
+        csv_path = _write_csv(ctx.tmpdir, "batch1.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(result_ids[0], "confirmed", "phone ok"),
+                               (result_ids[1], "reviewed", "")])
+
+        r = ctx.run(["batch-mark", csv_path])
+        assert "2" in r.stdout, f"Should report 2 imports: {r.stdout}"
+        assert r.returncode == 0
+
+        updated = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results WHERE id IN (?,?)",
+                                 (result_ids[0], result_ids[1]))
+        mark_map = {row["id"]: row for row in updated}
+        assert mark_map[result_ids[0]]["manual_mark"] == "confirmed", f"mark_text mismatch"
+        assert mark_map[result_ids[0]]["notes"] == "phone ok", f"notes mismatch"
+        assert mark_map[result_ids[1]]["manual_mark"] == "reviewed", f"mark_text mismatch for 2nd"
+        assert mark_map[result_ids[1]]["notes"] is None, f"empty notes should be None"
+
+        print("  [PASS] batch-mark happy path")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_nonexistent_result():
+    print("\n=== Test 10: batch-mark with non-existent result_id ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_bad.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(99999, "confirmed", "ghost")])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail on non-existent result_id"
+        assert "不存在" in r.stderr, f"Should mention not found: {r.stderr}"
+
+        results = ctx.db_execute("SELECT * FROM reconcile_results WHERE manual_mark IS NOT NULL")
+        assert len(results) == 0, "No data should be written when validation fails"
+
+        print("  [PASS] batch-mark non-existent result_id")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_duplicate_result_id():
+    print("\n=== Test 11: batch-mark with duplicate result_id in CSV ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_dup.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "confirmed", ""), (1, "reviewed", "dup")])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail on duplicate result_id"
+        assert "重复" in r.stderr, f"Should mention duplicate: {r.stderr}"
+
+        results = ctx.db_execute("SELECT * FROM reconcile_results WHERE manual_mark IS NOT NULL")
+        assert len(results) == 0, "No data should be written"
+
+        print("  [PASS] batch-mark duplicate result_id")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_empty_mark_text():
+    print("\n=== Test 12: batch-mark with empty mark_text ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_empty.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "", "some notes")])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail on empty mark_text"
+        assert "mark_text" in r.stderr, f"Should mention mark_text: {r.stderr}"
+
+        results = ctx.db_execute("SELECT * FROM reconcile_results WHERE notes = 'some notes'")
+        assert len(results) == 0, "No data should be written"
+
+        print("  [PASS] batch-mark empty mark_text")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_header_mismatch():
+    print("\n=== Test 13: batch-mark with CSV header mismatch ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_header.csv",
+                              ["id", "mark", "comment"],
+                              [(1, "confirmed", "")])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail on header mismatch"
+        assert "表头" in r.stderr, f"Should mention header: {r.stderr}"
+
+        print("  [PASS] batch-mark header mismatch")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_partial_invalid_rows():
+    print("\n=== Test 14: batch-mark with some valid and some invalid rows ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_partial.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "confirmed", "ok"),
+                               (99999, "ghost", "not found"),
+                               (2, "", "empty mark")])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail when any row is invalid"
+        assert "不存在" in r.stderr, f"Should report not found: {r.stderr}"
+        assert "mark_text" in r.stderr, f"Should report empty mark: {r.stderr}"
+
+        results = ctx.db_execute("SELECT * FROM reconcile_results WHERE manual_mark IS NOT NULL")
+        assert len(results) == 0, "All-or-nothing: no data should be written"
+
+        print("  [PASS] batch-mark partial invalid rows (all-or-nothing)")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_undo():
+    print("\n=== Test 15: batch-mark undo restores all previous marks ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["mark", "1", "--mark-text", "old_mark", "--notes", "old_note"])
+
+        result_before = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result_before["manual_mark"] == "old_mark", f"Pre-condition failed"
+        assert result_before["notes"] == "old_note", f"Pre-condition failed"
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_undo.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "new_mark", "new_note"),
+                               (2, "another", "another_note")])
+
+        ctx.run(["batch-mark", csv_path])
+
+        result_after = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result_after["manual_mark"] == "new_mark", f"Mark should be updated"
+        assert result_after["notes"] == "new_note", f"Notes should be updated"
+
+        ctx.run(["undo"])
+
+        result_restored = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result_restored["manual_mark"] == "old_mark", f"Undo should restore old mark: got {result_restored['manual_mark']}"
+        assert result_restored["notes"] == "old_note", f"Undo should restore old notes: got {result_restored['notes']}"
+
+        result2_restored = ctx.db_execute("SELECT id, manual_mark, notes FROM reconcile_results WHERE id=2")[0]
+        assert result2_restored["manual_mark"] is None, f"Undo should restore 2nd to None"
+        assert result2_restored["notes"] is None, f"Undo should restore 2nd notes to None"
+
+        print("  [PASS] batch-mark undo restores all previous marks")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_undo_then_reimport():
+    print("\n=== Test 16: batch-mark undo then re-import ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_reimport.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "first", "round1"),
+                               (2, "second", "round1")])
+
+        ctx.run(["batch-mark", csv_path])
+
+        ctx.run(["undo"])
+
+        csv_path2 = _write_csv(ctx.tmpdir, "batch_reimport2.csv",
+                               ["result_id", "mark_text", "notes"],
+                               [(1, "revised", "round2"),
+                                (3, "third", "round2")])
+
+        r = ctx.run(["batch-mark", csv_path2])
+        assert "2" in r.stdout, f"Should import 2 marks: {r.stdout}"
+
+        result1 = ctx.db_execute("SELECT manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result1["manual_mark"] == "revised", f"Should have revised mark"
+        assert result1["notes"] == "round2", f"Should have round2 notes"
+
+        result3 = ctx.db_execute("SELECT manual_mark, notes FROM reconcile_results WHERE id=3")[0]
+        assert result3["manual_mark"] == "third", f"Should have third mark"
+        assert result3["notes"] == "round2", f"Should have round2 notes"
+
+        print("  [PASS] batch-mark undo then re-import")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_export_csv_fields():
+    print("\n=== Test 17: batch-mark results appear in export CSV ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_export.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "confirmed", "verified by phone"),
+                               (2, "reviewed", "needs follow-up")])
+
+        ctx.run(["batch-mark", csv_path])
+
+        output_path = os.path.join(ctx.tmpdir, "export_result.csv")
+        ctx.run(["export", "--output", output_path])
+        rows = read_export_csv(output_path)
+
+        mark_key = "\ufeff标记" if "\ufeff标记" in rows[0] else "标记"
+        notes_key = "\ufeff备注" if "\ufeff备注" in rows[0] else "备注"
+        id_key = "\ufeffID" if "\ufeffID" in rows[0] else "ID"
+
+        row1 = next(r for r in rows if r[id_key] == "1")
+        assert row1[mark_key] == "confirmed", f"Export should contain mark: {row1[mark_key]}"
+        assert row1[notes_key] == "verified by phone", f"Export should contain notes: {row1[notes_key]}"
+
+        row2 = next(r for r in rows if r[id_key] == "2")
+        assert row2[mark_key] == "reviewed", f"Export should contain mark: {row2[mark_key]}"
+        assert row2[notes_key] == "needs follow-up", f"Export should contain notes: {row2[notes_key]}"
+
+        print("  [PASS] batch-mark results appear in export CSV")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_persistence_across_sessions():
+    print("\n=== Test 18: batch-mark data persists across process restarts ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_persist.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [(1, "persistent", "survives restart")])
+
+        ctx.run(["batch-mark", csv_path])
+
+        r1 = ctx.run(["status"])
+        assert "1" in r1.stdout or "result" in r1.stdout.lower(), f"Status should work: {r1.stdout}"
+
+        r2 = ctx.run(["status"])
+        assert "1" in r2.stdout or "result" in r2.stdout.lower(), f"Status consistent after restart: {r2.stdout}"
+
+        result = ctx.db_execute("SELECT manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result["manual_mark"] == "persistent", f"Data should persist in DB"
+        assert result["notes"] == "survives restart", f"Notes should persist in DB"
+
+        output_path = os.path.join(ctx.tmpdir, "persist_check.csv")
+        ctx.run(["export", "--output", output_path])
+        rows = read_export_csv(output_path)
+        mark_key = "\ufeff标记" if "\ufeff标记" in rows[0] else "标记"
+        row1 = next(r for r in rows if r.get("\ufeffID", r.get("ID")) == "1")
+        assert row1[mark_key] == "persistent", f"Export after restart should show mark"
+
+        r3 = ctx.run(["errors"])
+        assert r3.returncode == 0
+
+        print("  [PASS] batch-mark data persists across process restarts")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_no_notes_column():
+    print("\n=== Test 19: batch-mark CSV without notes column ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        csv_path = _write_csv(ctx.tmpdir, "batch_no_notes.csv",
+                              ["result_id", "mark_text"],
+                              [(1, "confirmed")])
+
+        r = ctx.run(["batch-mark", csv_path])
+        assert r.returncode == 0, f"Should succeed without notes column: {r.stderr}"
+
+        result = ctx.db_execute("SELECT manual_mark, notes FROM reconcile_results WHERE id=1")[0]
+        assert result["manual_mark"] == "confirmed", f"Mark should be set"
+        assert result["notes"] is None, f"Notes should remain None"
+
+        print("  [PASS] batch-mark CSV without notes column")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_batch_mark_empty_csv():
+    print("\n=== Test 20: batch-mark empty CSV file ===")
+    ctx = TestContext()
+    try:
+        csv_path = _write_csv(ctx.tmpdir, "empty.csv",
+                              ["result_id", "mark_text", "notes"],
+                              [])
+
+        r = ctx.run(["batch-mark", csv_path], expect_fail=True)
+        assert r.returncode != 0, "Should fail on empty CSV"
+        assert "为空" in r.stderr, f"Should mention empty: {r.stderr}"
+
+        print("  [PASS] batch-mark empty CSV file")
+
+    finally:
+        ctx.cleanup()
+
+
 if __name__ == "__main__":
     os.chdir(os.path.dirname(__file__) + "/..")
     print("Running acceptance tests...")
@@ -574,4 +931,16 @@ if __name__ == "__main__":
     test_import_idempotency()
     test_import_bom_json()
     test_old_db_migration_with_duplicates()
+    test_batch_mark_happy_path()
+    test_batch_mark_nonexistent_result()
+    test_batch_mark_duplicate_result_id()
+    test_batch_mark_empty_mark_text()
+    test_batch_mark_header_mismatch()
+    test_batch_mark_partial_invalid_rows()
+    test_batch_mark_undo()
+    test_batch_mark_undo_then_reimport()
+    test_batch_mark_export_csv_fields()
+    test_batch_mark_persistence_across_sessions()
+    test_batch_mark_no_notes_column()
+    test_batch_mark_empty_csv()
     print("\n[OK] All acceptance tests passed!")
