@@ -123,27 +123,28 @@ def test_import_errors():
         ctx.run(["import-enroll", enroll_path])
         ctx.run(["import-rules", rules_path])
 
+        enroll_count_before = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
+
         enroll_err_path = ctx.copy_sample("enroll_errors.csv")
         r = ctx.run(["import-enroll", enroll_err_path])
-        assert "2" in r.stdout, f"Should import 2 valid enroll records: {r.stdout}"
+        assert "手机" in r.stdout, f"Should report phone error: {r.stdout}"
+        assert "场次" in r.stdout, f"Should report session error: {r.stdout}"
 
         signin_err_path = ctx.copy_sample("signin_errors.csv")
         r = ctx.run(["import-signin", signin_err_path])
-        assert "2" in r.stdout, f"Should import 2 valid signin records: {r.stdout}"
+        assert "手机" in r.stdout, f"Should report phone error: {r.stdout}"
+        assert "不存在" in r.stdout, f"Should report invalid session: {r.stdout}"
 
         errors = ctx.db_execute("SELECT * FROM import_errors")
         assert len(errors) >= 4, f"Should have at least 4 import errors: {len(errors)}"
 
-        error_msgs = [e["error_message"] for e in errors]
-        has_phone_error = any("phone" in e.lower() or "手机" in e for e in error_msgs)
-        has_session_error = any("session" in e.lower() or "场次" in e for e in error_msgs)
-        assert has_phone_error, f"Should have phone error: {error_msgs}"
-        assert has_session_error, f"Should have session error: {error_msgs}"
+        enroll_count_after = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
+        assert enroll_count_after == enroll_count_before, f"Enrollment count should be unchanged due to idempotency: {enroll_count_before} vs {enroll_count_after}"
 
-        enroll_count = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
-        assert enroll_count == 10, f"Old data should be preserved: {enroll_count}"
+        r = ctx.run(["status"])
+        assert str(enroll_count_before) in r.stdout, f"Status should show enrollment count: {r.stdout}"
 
-        print(f"  Import errors: {len(errors)}, Enrollments preserved: {enroll_count}")
+        print(f"  Import errors: {len(errors)}, Enrollments preserved: {enroll_count_after}")
         print("  [PASS] Import errors handled correctly")
 
     finally:
@@ -264,6 +265,110 @@ def test_undo_import():
         ctx.cleanup()
 
 
+def test_import_idempotency():
+    print("\n=== Test 6: Import idempotency (duplicate import) ===")
+    ctx = TestContext()
+    try:
+        enroll_path = ctx.copy_sample("enroll.csv")
+        signin_path = ctx.copy_sample("signin.csv")
+        rules_path = ctx.copy_sample("rules.json")
+
+        r1 = ctx.run(["import-enroll", enroll_path])
+        assert "8" in r1.stdout and "跳过 0" in r1.stdout, f"First import: {r1.stdout}"
+
+        enroll_count_1 = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
+        assert enroll_count_1 == 8, f"Expected 8 after first import, got {enroll_count_1}"
+
+        r2 = ctx.run(["import-enroll", enroll_path])
+        assert "跳过 8" in r2.stdout, f"Second import should skip 8: {r2.stdout}"
+
+        enroll_count_2 = ctx.db_execute("SELECT COUNT(*) as c FROM enrollments")[0]["c"]
+        assert enroll_count_2 == 8, f"Expected 8 after second import, got {enroll_count_2}"
+
+        ctx.run(["import-rules", rules_path])
+
+        r3 = ctx.run(["import-signin", signin_path])
+        assert "6" in r3.stdout and "跳过 0" in r3.stdout, f"First signin import: {r3.stdout}"
+
+        signin_count_1 = ctx.db_execute("SELECT COUNT(*) as c FROM signins")[0]["c"]
+        assert signin_count_1 == 6, f"Expected 6 after first signin import, got {signin_count_1}"
+
+        r4 = ctx.run(["import-signin", signin_path])
+        assert "跳过 6" in r4.stdout, f"Second signin import should skip 6: {r4.stdout}"
+
+        signin_count_2 = ctx.db_execute("SELECT COUNT(*) as c FROM signins")[0]["c"]
+        assert signin_count_2 == 6, f"Expected 6 after second signin import, got {signin_count_2}"
+
+        ctx.run(["reconcile"])
+
+        output1 = os.path.join(ctx.tmpdir, "result1.csv")
+        ctx.run(["export", "--output", output1])
+        rows1 = read_export_csv(output1)
+
+        r_status = ctx.run(["status"])
+        assert "8" in r_status.stdout, f"Should still have 8 enrollments in status: {r_status.stdout}"
+        assert "6" in r_status.stdout, f"Should still have 6 signins in status: {r_status.stdout}"
+
+        status_key = "\ufeff状态" if "\ufeff状态" in rows1[0] else "状态"
+        absent_count = sum(1 for r in rows1 if r[status_key] == "缺席")
+        normal_count = sum(1 for r in rows1 if r[status_key] == "正常签到")
+
+        ctx.run(["import-enroll", enroll_path])
+        ctx.run(["import-signin", signin_path])
+        ctx.run(["reconcile"])
+
+        output2 = os.path.join(ctx.tmpdir, "result2.csv")
+        ctx.run(["export", "--output", output2])
+        rows2 = read_export_csv(output2)
+
+        absent_count_2 = sum(1 for r in rows2 if r[status_key] == "缺席")
+        normal_count_2 = sum(1 for r in rows2 if r[status_key] == "正常签到")
+
+        assert absent_count == absent_count_2, f"Absent count changed: {absent_count} -> {absent_count_2}"
+        assert normal_count == normal_count_2, f"Normal count changed: {normal_count} -> {normal_count_2}"
+        assert len(rows1) == len(rows2), f"Row count changed: {len(rows1)} -> {len(rows2)}"
+
+        print(f"  Enroll: {enroll_count_1} -> {enroll_count_2} (stable)")
+        print(f"  Signin: {signin_count_1} -> {signin_count_2} (stable)")
+        print(f"  Reconcile rows: {len(rows1)} -> {len(rows2)} (stable)")
+        print(f"  Absent: {absent_count} -> {absent_count_2}, Normal: {normal_count} -> {normal_count_2}")
+        print("  [PASS] Import idempotency")
+
+    finally:
+        ctx.cleanup()
+
+
+def test_import_bom_json():
+    print("\n=== Test 7: Import rules with UTF-8 BOM ===")
+    ctx = TestContext()
+    try:
+        bom_path = ctx.copy_sample("rules_bom.json")
+
+        with open(bom_path, "rb") as f:
+            header = f.read(3)
+            assert header == b"\xef\xbb\xbf", f"File should have BOM, got {header!r}"
+
+        r = ctx.run(["import-rules", bom_path])
+        assert "2" in r.stdout, f"Should import 2 rules: {r.stdout}"
+
+        rules_count = ctx.db_execute("SELECT COUNT(*) as c FROM rules")[0]["c"]
+        assert rules_count == 2, f"Expected 2 rules, got {rules_count}"
+
+        enroll_path = ctx.copy_sample("enroll.csv")
+        signin_path = ctx.copy_sample("signin.csv")
+        ctx.run(["import-enroll", enroll_path])
+        ctx.run(["import-signin", signin_path])
+
+        r = ctx.run(["reconcile"])
+        assert "normal" in r.stdout or "4" in r.stdout, f"Reconcile should work: {r.stdout}"
+
+        print(f"  BOM rules imported: {rules_count}")
+        print("  [PASS] UTF-8 BOM JSON import")
+
+    finally:
+        ctx.cleanup()
+
+
 if __name__ == "__main__":
     os.chdir(os.path.dirname(__file__) + "/..")
     print("Running acceptance tests...")
@@ -272,4 +377,6 @@ if __name__ == "__main__":
     test_duplicate_scan()
     test_persistence()
     test_undo_import()
+    test_import_idempotency()
+    test_import_bom_json()
     print("\n[OK] All acceptance tests passed!")

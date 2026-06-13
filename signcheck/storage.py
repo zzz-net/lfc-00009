@@ -2,7 +2,7 @@ import sqlite3
 import json
 import os
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from .models import (
     EnrollmentRecord,
     SigninRecord,
@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS enrollments (
     session TEXT NOT NULL,
     source_file TEXT,
     source_row INTEGER,
-    imported_at TEXT NOT NULL
+    imported_at TEXT NOT NULL,
+    UNIQUE(phone, session)
 );
 
 CREATE TABLE IF NOT EXISTS signins (
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS signins (
     scan_time TEXT,
     source_file TEXT,
     source_row INTEGER,
-    imported_at TEXT NOT NULL
+    imported_at TEXT NOT NULL,
+    UNIQUE(phone, session, scan_time)
 );
 
 CREATE TABLE IF NOT EXISTS rules (
@@ -105,7 +107,37 @@ class Storage:
 
     def _init_tables(self):
         self.conn.executescript(SCHEMA)
+        self._migrate_tables()
         self.conn.commit()
+
+    def _migrate_tables(self):
+        self._migrate_unique_constraint("enrollments", ["phone", "session"])
+        self._migrate_unique_constraint("signins", ["phone", "session", "scan_time"])
+
+    def _migrate_unique_constraint(self, table: str, unique_cols: List[str]):
+        cur = self.conn.execute(f"PRAGMA index_list({table})")
+        has_unique = False
+        for idx in cur.fetchall():
+            if idx["origin"] == "u":
+                has_unique = True
+                break
+        if has_unique:
+            return
+        cols_sql = ",".join(unique_cols)
+        tmp_table = f"{table}_tmp"
+        cur = self.conn.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'")
+        row = cur.fetchone()
+        if row is None:
+            return
+        old_sql = row["sql"]
+        new_sql = old_sql.rstrip(")") + f", UNIQUE({cols_sql}))"
+        cur = self.conn.execute(f"PRAGMA table_info({table})")
+        col_names = [r["name"] for r in cur.fetchall()]
+        cols_csv = ",".join(col_names)
+        self.conn.execute(f"ALTER TABLE {table} RENAME TO {tmp_table}")
+        self.conn.execute(new_sql)
+        self.conn.execute(f"INSERT INTO {table} ({cols_csv}) SELECT {cols_csv} FROM {tmp_table}")
+        self.conn.execute(f"DROP TABLE {tmp_table}")
 
     def close(self):
         self.conn.close()
@@ -123,17 +155,32 @@ class Storage:
         self.conn.commit()
         return cur.lastrowid
 
-    def add_enrollments(self, records: List[EnrollmentRecord]) -> List[int]:
-        ids = []
+    def add_enrollments(self, records: List[EnrollmentRecord]) -> Tuple[List[int], List[int]]:
+        new_ids: List[int] = []
+        existing_ids: List[int] = []
         now = self._now()
         for r in records:
+            existing = self.conn.execute(
+                "SELECT id FROM enrollments WHERE phone=? AND session=?",
+                (r.phone, r.session),
+            ).fetchone()
+            if existing is not None:
+                existing_ids.append(existing["id"])
+                continue
             cur = self.conn.execute(
                 "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
                 (r.name, r.phone, r.session, r.source_file, r.source_row, now),
             )
-            ids.append(cur.lastrowid)
+            new_ids.append(cur.lastrowid)
         self.conn.commit()
-        return ids
+        return new_ids, existing_ids
+
+    def find_enrollment_id(self, phone: str, session: str) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT id FROM enrollments WHERE phone=? AND session=?",
+            (phone, session),
+        ).fetchone()
+        return row["id"] if row else None
 
     def get_all_enrollments(self) -> List[EnrollmentRecord]:
         rows = self.conn.execute("SELECT * FROM enrollments ORDER BY id").fetchall()
@@ -164,17 +211,32 @@ class Storage:
         self.conn.commit()
         return cur.lastrowid
 
-    def add_signins(self, records: List[SigninRecord]) -> List[int]:
-        ids = []
+    def add_signins(self, records: List[SigninRecord]) -> Tuple[List[int], List[int]]:
+        new_ids: List[int] = []
+        existing_ids: List[int] = []
         now = self._now()
         for r in records:
+            existing = self.conn.execute(
+                "SELECT id FROM signins WHERE phone=? AND session=? AND scan_time=?",
+                (r.phone, r.session, r.scan_time),
+            ).fetchone()
+            if existing is not None:
+                existing_ids.append(existing["id"])
+                continue
             cur = self.conn.execute(
                 "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
                 (r.name, r.phone, r.session, r.scan_time, r.source_file, r.source_row, now),
             )
-            ids.append(cur.lastrowid)
+            new_ids.append(cur.lastrowid)
         self.conn.commit()
-        return ids
+        return new_ids, existing_ids
+
+    def find_signin_id(self, phone: str, session: str, scan_time: str) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT id FROM signins WHERE phone=? AND session=? AND scan_time=?",
+            (phone, session, scan_time),
+        ).fetchone()
+        return row["id"] if row else None
 
     def get_all_signins(self) -> List[SigninRecord]:
         rows = self.conn.execute("SELECT * FROM signins ORDER BY id").fetchall()

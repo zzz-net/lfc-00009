@@ -103,14 +103,17 @@ def import_enroll(csv_file: str):
         ))
 
     if valid_records:
-        ids = storage.add_enrollments(valid_records)
-        undo_data = json.dumps({"action": "import_enroll", "ids": ids})
-        storage.add_undo_action("import_enroll", undo_data)
+        new_ids, existing_ids = storage.add_enrollments(valid_records)
+        if new_ids:
+            undo_data = json.dumps({"action": "import_enroll", "ids": new_ids})
+            storage.add_undo_action("import_enroll", undo_data)
+    else:
+        new_ids, existing_ids = [], []
 
     if errors:
         storage.add_import_errors(errors)
 
-    click.echo(f"[OK] 成功导入 {len(valid_records)} 条报名记录")
+    click.echo(f"[OK] 新增 {len(new_ids)} 条报名记录，跳过 {len(existing_ids)} 条已存在记录")
     if errors:
         for e in errors:
             click.echo(f"[ERR] {e.error_message}")
@@ -175,14 +178,17 @@ def import_signin(csv_file: str):
         ))
 
     if valid_records:
-        ids = storage.add_signins(valid_records)
-        undo_data = json.dumps({"action": "import_signin", "ids": ids})
-        storage.add_undo_action("import_signin", undo_data)
+        new_ids, existing_ids = storage.add_signins(valid_records)
+        if new_ids:
+            undo_data = json.dumps({"action": "import_signin", "ids": new_ids})
+            storage.add_undo_action("import_signin", undo_data)
+    else:
+        new_ids, existing_ids = [], []
 
     if errors:
         storage.add_import_errors(errors)
 
-    click.echo(f"[OK] 成功导入 {len(valid_records)} 条签到记录")
+    click.echo(f"[OK] 新增 {len(new_ids)} 条签到记录，跳过 {len(existing_ids)} 条已存在记录")
     if errors:
         for e in errors:
             click.echo(f"[ERR] {e.error_message}")
@@ -201,7 +207,7 @@ def import_rules(json_file: str):
         click.echo(f"错误：文件不存在 {abs_path}", err=True)
         sys.exit(1)
 
-    with open(abs_path, "r", encoding="utf-8") as f:
+    with open(abs_path, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
 
     prev_rules = storage.get_all_rules()
