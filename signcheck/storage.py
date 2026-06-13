@@ -1,0 +1,364 @@
+import sqlite3
+import json
+import os
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from .models import (
+    EnrollmentRecord,
+    SigninRecord,
+    MatchRule,
+    ReconcileResult,
+    ImportErrorRecord,
+    UndoAction,
+    FieldMapping,
+)
+
+def _resolve_db_dir():
+    env_dir = os.environ.get("SIGNCHECK_DB_DIR")
+    if env_dir:
+        return os.path.join(env_dir, ".signcheck")
+    return os.path.join(os.getcwd(), ".signcheck")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS enrollments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT,
+    session TEXT NOT NULL,
+    source_file TEXT,
+    source_row INTEGER,
+    imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT,
+    session TEXT NOT NULL,
+    scan_time TEXT,
+    source_file TEXT,
+    source_row INTEGER,
+    imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    field_name TEXT NOT NULL,
+    match_type TEXT NOT NULL DEFAULT 'exact',
+    threshold REAL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS field_mapping (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mapping_type TEXT NOT NULL,
+    field_name TEXT NOT NULL,
+    csv_column TEXT NOT NULL,
+    imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reconcile_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    enroll_id INTEGER,
+    signin_id INTEGER,
+    name TEXT NOT NULL,
+    phone TEXT,
+    session TEXT NOT NULL,
+    status TEXT NOT NULL,
+    manual_mark TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS undo_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_type TEXT NOT NULL,
+    action_data TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS import_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL,
+    source_file TEXT,
+    row_number INTEGER NOT NULL,
+    error_type TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    raw_data TEXT
+);
+"""
+
+
+class Storage:
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            db_dir = _resolve_db_dir()
+            db_path = os.path.join(db_dir, "signcheck.db")
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._init_tables()
+
+    def _init_tables(self):
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+    def _now(self) -> str:
+        return datetime.now().isoformat()
+
+    # ── Enrollment ──────────────────────────────────────────────
+
+    def add_enrollment(self, record: EnrollmentRecord) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+            (record.name, record.phone, record.session, record.source_file, record.source_row, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_enrollments(self, records: List[EnrollmentRecord]) -> List[int]:
+        ids = []
+        now = self._now()
+        for r in records:
+            cur = self.conn.execute(
+                "INSERT INTO enrollments (name,phone,session,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?)",
+                (r.name, r.phone, r.session, r.source_file, r.source_row, now),
+            )
+            ids.append(cur.lastrowid)
+        self.conn.commit()
+        return ids
+
+    def get_all_enrollments(self) -> List[EnrollmentRecord]:
+        rows = self.conn.execute("SELECT * FROM enrollments ORDER BY id").fetchall()
+        return [EnrollmentRecord(**dict(r)) for r in rows]
+
+    def get_enrollment_sessions(self) -> set:
+        rows = self.conn.execute("SELECT DISTINCT session FROM enrollments").fetchall()
+        return {r["session"] for r in rows}
+
+    def delete_enrollments_by_ids(self, ids: List[int]):
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM enrollments WHERE id IN ({placeholders})", ids)
+        self.conn.commit()
+
+    def clear_enrollments(self):
+        self.conn.execute("DELETE FROM enrollments")
+        self.conn.commit()
+
+    # ── Sign-in ────────────────────────────────────────────────
+
+    def add_signin(self, record: SigninRecord) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
+            (record.name, record.phone, record.session, record.scan_time, record.source_file, record.source_row, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_signins(self, records: List[SigninRecord]) -> List[int]:
+        ids = []
+        now = self._now()
+        for r in records:
+            cur = self.conn.execute(
+                "INSERT INTO signins (name,phone,session,scan_time,source_file,source_row,imported_at) VALUES (?,?,?,?,?,?,?)",
+                (r.name, r.phone, r.session, r.scan_time, r.source_file, r.source_row, now),
+            )
+            ids.append(cur.lastrowid)
+        self.conn.commit()
+        return ids
+
+    def get_all_signins(self) -> List[SigninRecord]:
+        rows = self.conn.execute("SELECT * FROM signins ORDER BY id").fetchall()
+        return [SigninRecord(**dict(r)) for r in rows]
+
+    def delete_signins_by_ids(self, ids: List[int]):
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM signins WHERE id IN ({placeholders})", ids)
+        self.conn.commit()
+
+    def clear_signins(self):
+        self.conn.execute("DELETE FROM signins")
+        self.conn.commit()
+
+    # ── Rules ──────────────────────────────────────────────────
+
+    def add_rules(self, rules: List[MatchRule]) -> List[int]:
+        ids = []
+        now = self._now()
+        for r in rules:
+            cur = self.conn.execute(
+                "INSERT INTO rules (field_name,match_type,threshold,priority,imported_at) VALUES (?,?,?,?,?)",
+                (r.field_name, r.match_type, r.threshold, r.priority, now),
+            )
+            ids.append(cur.lastrowid)
+        self.conn.commit()
+        return ids
+
+    def get_all_rules(self) -> List[MatchRule]:
+        rows = self.conn.execute("SELECT * FROM rules ORDER BY priority").fetchall()
+        return [MatchRule(**dict(r)) for r in rows]
+
+    def clear_rules(self):
+        self.conn.execute("DELETE FROM rules")
+        self.conn.commit()
+
+    # ── Field Mapping ──────────────────────────────────────────
+
+    def save_field_mapping(self, mapping: FieldMapping):
+        self.conn.execute("DELETE FROM field_mapping")
+        now = self._now()
+        for field_name, csv_col in mapping.enroll.items():
+            self.conn.execute(
+                "INSERT INTO field_mapping (mapping_type,field_name,csv_column,imported_at) VALUES (?,?,?,?)",
+                ("enroll", field_name, csv_col, now),
+            )
+        for field_name, csv_col in mapping.signin.items():
+            self.conn.execute(
+                "INSERT INTO field_mapping (mapping_type,field_name,csv_column,imported_at) VALUES (?,?,?,?)",
+                ("signin", field_name, csv_col, now),
+            )
+        self.conn.commit()
+
+    def get_field_mapping(self) -> FieldMapping:
+        mapping = FieldMapping()
+        rows = self.conn.execute("SELECT * FROM field_mapping").fetchall()
+        for r in rows:
+            if r["mapping_type"] == "enroll":
+                mapping.enroll[r["field_name"]] = r["csv_column"]
+            elif r["mapping_type"] == "signin":
+                mapping.signin[r["field_name"]] = r["csv_column"]
+        return mapping
+
+    # ── Reconcile Results ──────────────────────────────────────
+
+    def add_reconcile_result(self, result: ReconcileResult) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO reconcile_results (enroll_id,signin_id,name,phone,session,status,manual_mark,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (result.enroll_id, result.signin_id, result.name, result.phone, result.session, result.status, result.manual_mark, result.notes, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_reconcile_results(self, results: List[ReconcileResult]) -> List[int]:
+        ids = []
+        now = self._now()
+        for r in results:
+            cur = self.conn.execute(
+                "INSERT INTO reconcile_results (enroll_id,signin_id,name,phone,session,status,manual_mark,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (r.enroll_id, r.signin_id, r.name, r.phone, r.session, r.status, r.manual_mark, r.notes, now),
+            )
+            ids.append(cur.lastrowid)
+        self.conn.commit()
+        return ids
+
+    def get_all_reconcile_results(self) -> List[ReconcileResult]:
+        rows = self.conn.execute("SELECT * FROM reconcile_results ORDER BY id").fetchall()
+        return [ReconcileResult(**dict(r)) for r in rows]
+
+    def get_reconcile_result_by_id(self, result_id: int) -> Optional[ReconcileResult]:
+        row = self.conn.execute("SELECT * FROM reconcile_results WHERE id=?", (result_id,)).fetchone()
+        if row is None:
+            return None
+        return ReconcileResult(**dict(row))
+
+    def update_reconcile_result_mark(self, result_id: int, manual_mark: Optional[str], notes: Optional[str]):
+        self.conn.execute(
+            "UPDATE reconcile_results SET manual_mark=?, notes=? WHERE id=?",
+            (manual_mark, notes, result_id),
+        )
+        self.conn.commit()
+
+    def clear_reconcile_results(self):
+        self.conn.execute("DELETE FROM reconcile_results")
+        self.conn.commit()
+
+    def count_reconcile_results_by_status(self) -> Dict[str, int]:
+        rows = self.conn.execute("SELECT status, COUNT(*) as cnt FROM reconcile_results GROUP BY status").fetchall()
+        return {r["status"]: r["cnt"] for r in rows}
+
+    # ── Import Errors ──────────────────────────────────────────
+
+    def add_import_error(self, error: ImportErrorRecord) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO import_errors (source_type,source_file,row_number,error_type,error_message,raw_data) VALUES (?,?,?,?,?,?)",
+            (error.source_type, error.source_file, error.row_number, error.error_type, error.error_message, error.raw_data),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_import_errors(self, errors: List[ImportErrorRecord]) -> List[int]:
+        ids = []
+        for e in errors:
+            cur = self.conn.execute(
+                "INSERT INTO import_errors (source_type,source_file,row_number,error_type,error_message,raw_data) VALUES (?,?,?,?,?,?)",
+                (e.source_type, e.source_file, e.row_number, e.error_type, e.error_message, e.raw_data),
+            )
+            ids.append(cur.lastrowid)
+        self.conn.commit()
+        return ids
+
+    def get_all_import_errors(self) -> List[ImportErrorRecord]:
+        rows = self.conn.execute("SELECT * FROM import_errors ORDER BY id").fetchall()
+        return [ImportErrorRecord(**dict(r)) for r in rows]
+
+    def clear_import_errors(self):
+        self.conn.execute("DELETE FROM import_errors")
+        self.conn.commit()
+
+    # ── Undo History ───────────────────────────────────────────
+
+    def add_undo_action(self, action_type: str, action_data: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO undo_history (action_type,action_data,created_at) VALUES (?,?,?)",
+            (action_type, action_data, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_last_undo_action(self) -> Optional[UndoAction]:
+        row = self.conn.execute("SELECT * FROM undo_history ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return UndoAction(**dict(row))
+
+    def pop_last_undo_action(self) -> Optional[UndoAction]:
+        action = self.get_last_undo_action()
+        if action is not None:
+            self.conn.execute("DELETE FROM undo_history WHERE id=?", (action.id,))
+            self.conn.commit()
+        return action
+
+    def get_undo_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) as cnt FROM undo_history").fetchone()
+        return row["cnt"]
+
+    # ── Statistics ─────────────────────────────────────────────
+
+    def get_stats(self) -> Dict[str, Any]:
+        enroll_cnt = self.conn.execute("SELECT COUNT(*) as c FROM enrollments").fetchone()["c"]
+        signin_cnt = self.conn.execute("SELECT COUNT(*) as c FROM signins").fetchone()["c"]
+        rules_cnt = self.conn.execute("SELECT COUNT(*) as c FROM rules").fetchone()["c"]
+        result_cnt = self.conn.execute("SELECT COUNT(*) as c FROM reconcile_results").fetchone()["c"]
+        undo_cnt = self.conn.execute("SELECT COUNT(*) as c FROM undo_history").fetchone()["c"]
+        error_cnt = self.conn.execute("SELECT COUNT(*) as c FROM import_errors").fetchone()["c"]
+        status_counts = self.count_reconcile_results_by_status()
+        return {
+            "enrollment_count": enroll_cnt,
+            "signin_count": signin_cnt,
+            "rules_count": rules_cnt,
+            "result_count": result_cnt,
+            "undo_count": undo_cnt,
+            "error_count": error_cnt,
+            "status_counts": status_counts,
+        }

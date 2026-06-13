@@ -1,0 +1,19 @@
+{
+  "field_mapping": {
+    "enroll": {
+      "name": "姓名",
+      "phone": "手机号",
+      "session": "场次"
+    },
+    "signin": {
+      "name": "姓名",
+      "phone": "手机号",
+      "session": "场次",
+      "scan_time": "扫码时间"
+    }
+  },
+  "match_rules": [
+    {"field": "phone", "match_type": "exact", "priority": 1},
+    {"field": "name", "match_type": "exact", "priority": 2}
+  ]
+}
