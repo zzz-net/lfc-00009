@@ -34,7 +34,26 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, Field
 
-from .cli import STATUS_LABELS, _build_html_report
+from .constants import STATUS_LABELS, VALID_STATUSES
+from .csv_utils import parse_csv_content, apply_field_mapping
+from .import_service import (
+    import_enrollments,
+    import_signins,
+    import_rules,
+    validate_enroll_rows,
+    validate_signin_rows,
+    get_enroll_mapping,
+    get_signin_mapping,
+)
+from .export_service import (
+    result_to_dict,
+    compute_status_counts,
+    format_csv_content,
+    write_xlsx_file,
+    build_html_report,
+    build_session_stats_for_report,
+    build_session_detail,
+)
 from .models import (
     EnrollmentRecord,
     FieldMapping,
@@ -61,8 +80,6 @@ API_PORT = int(os.environ.get("SIGNCHECK_API_PORT", "8000"))
 
 LOG_DIR = os.path.join(os.getcwd(), ".signcheck", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-
-VALID_STATUSES = {"normal", "absent", "non_enrolled", "duplicate"}
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -264,62 +281,6 @@ async def log_requests(request: Request, call_next):
 # Helpers
 # ──────────────────────────────────────────────────────────────────
 
-def _parse_csv_content(content: bytes) -> List[Dict[str, str]]:
-    text = content.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    return [dict(row) for row in reader]
-
-
-def _apply_field_mapping(rows: List[dict], mapping: Dict[str, str]) -> List[dict]:
-    if not mapping:
-        return rows
-    mapped = []
-    for row in rows:
-        new_row = {}
-        for field_name, csv_col in mapping.items():
-            new_row[field_name] = (row.get(csv_col, "") or "").strip()
-        mapped.append(new_row)
-    return mapped
-
-
-def _result_to_dict(r: ReconcileResult) -> dict:
-    return {
-        "id": r.id,
-        "enroll_id": r.enroll_id,
-        "signin_id": r.signin_id,
-        "name": r.name,
-        "phone": r.phone,
-        "session": r.session,
-        "status": {
-            "code": r.status,
-            "label": STATUS_LABELS.get(r.status, r.status),
-        },
-        "manual_mark": r.manual_mark,
-        "notes": r.notes,
-        "created_at": r.created_at,
-    }
-
-
-def _session_detail(storage: Storage, session_name: str, all_results: List[ReconcileResult]) -> dict:
-    session_results = [r for r in all_results if r.session == session_name]
-    total = len(session_results)
-    status_counts: Dict[str, int] = defaultdict(int)
-    for r in session_results:
-        status_counts[r.status] += 1
-    pct = lambda c: f"{c / total * 100:.2f}%" if total > 0 else "0.00%"
-    return {
-        "session": session_name,
-        "total": total,
-        "status_breakdown": {
-            s: {
-                "count": status_counts.get(s, 0),
-                "label": STATUS_LABELS.get(s, s),
-                "percentage": pct(status_counts.get(s, 0)),
-            }
-            for s in ["normal", "absent", "non_enrolled", "duplicate"]
-        },
-    }
-
 
 # ──────────────────────────────────────────────────────────────────
 # /health — 探活接口（无需鉴权）
@@ -386,12 +347,12 @@ def import_enroll_file(
     finally:
         file.file.close()
 
-    rows = _parse_csv_content(content)
+    rows = parse_csv_content(content)
     filename = os.path.basename(file.filename or "enroll.csv")
 
     field_mapping = storage.get_field_mapping()
     mapping = field_mapping.enroll or {"name": "姓名", "phone": "手机号", "session": "场次"}
-    mapped_rows = _apply_field_mapping(rows, mapping)
+    mapped_rows = apply_field_mapping(rows, mapping)
 
     valid_records: List[EnrollmentRecord] = []
     errors: List[Dict[str, Any]] = []
@@ -521,12 +482,12 @@ def import_signin_file(
     finally:
         file.file.close()
 
-    rows = _parse_csv_content(content)
+    rows = parse_csv_content(content)
     filename = os.path.basename(file.filename or "signin.csv")
 
     field_mapping = storage.get_field_mapping()
     mapping = field_mapping.signin or {"name": "姓名", "phone": "手机号", "session": "场次", "scan_time": "扫码时间"}
-    mapped_rows = _apply_field_mapping(rows, mapping)
+    mapped_rows = apply_field_mapping(rows, mapping)
     existing_sessions = storage.get_enrollment_sessions()
 
     valid_records: List[SigninRecord] = []
@@ -901,7 +862,7 @@ def list_results(
         "count": len(results),
         "offset": offset,
         "limit": limit,
-        "records": [_result_to_dict(r) for r in results],
+        "records": [result_to_dict(r) for r in results],
     })
 
 
@@ -914,7 +875,7 @@ def get_result(
     r = storage.get_reconcile_result_by_id(result_id)
     if r is None:
         raise HTTPException(404, f"结果 #{result_id} 不存在")
-    data = _result_to_dict(r)
+    data = result_to_dict(r)
     if r.enroll_id:
         er = storage.conn.execute("SELECT * FROM enrollments WHERE id=?", (r.enroll_id,)).fetchone()
         if er:
@@ -1041,42 +1002,15 @@ def export_endpoint(
     if not results:
         raise HTTPException(400, "暂无对账结果可导出")
 
-    status_counts: Dict[str, int] = defaultdict(int)
-    for r in results:
-        status_counts[r.status] += 1
+    status_counts = compute_status_counts(results)
 
     if fmt == "json":
-        records = []
-        for r in results:
-            records.append({
-                "id": r.id, "name": r.name, "phone": r.phone,
-                "session": r.session,
-                "status": {"code": r.status, "label": STATUS_LABELS.get(r.status, r.status)},
-                "manual_mark": r.manual_mark, "notes": r.notes,
-                "references": {"enroll_id": r.enroll_id, "signin_id": r.signin_id},
-                "created_at": r.created_at,
-            })
-        data = {
-            "meta": {
-                "generated_at": datetime.now().isoformat(),
-                "total": len(results),
-                "status_summary": {STATUS_LABELS[s]: c for s, c in status_counts.items()},
-            },
-            "records": records,
-        }
+        data = build_json_data(results, status_counts)
         return ApiResponse(data=data)
 
     if fmt == "csv":
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"])
-        for r in results:
-            writer.writerow([
-                r.id, r.name, r.phone or "", r.session,
-                STATUS_LABELS.get(r.status, r.status),
-                r.manual_mark or "", r.notes or "",
-            ])
-        content = buf.getvalue().encode("utf-8-sig")
+        csv_content = format_csv_content(results)
+        content = csv_content.encode("utf-8-sig")
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8-sig",
@@ -1085,38 +1019,15 @@ def export_endpoint(
 
     if fmt == "xlsx":
         try:
-            from openpyxl import Workbook
-            from openpyxl.styles import Font, Alignment
-            from openpyxl.utils import get_column_letter
-        except ImportError:
+            headers, rows = build_results_xlsx_rows(results)
+        except Exception:
             raise HTTPException(500, "openpyxl 未安装")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "对账结果"
-        headers = ["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"]
-        bold = Font(bold=True)
-        for c, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=c, value=h)
-            cell.font = bold
-            cell.alignment = Alignment(horizontal="center")
-        for ri, r in enumerate(results, 2):
-            ws.cell(row=ri, column=1, value=r.id)
-            ws.cell(row=ri, column=2, value=r.name)
-            ws.cell(row=ri, column=3, value=r.phone or "")
-            ws.cell(row=ri, column=4, value=r.session)
-            ws.cell(row=ri, column=5, value=STATUS_LABELS.get(r.status, r.status))
-            ws.cell(row=ri, column=6, value=r.manual_mark or "")
-            ws.cell(row=ri, column=7, value=r.notes or "")
-        for c in range(1, len(headers) + 1):
-            max_len = len(headers[c - 1])
-            for row in ws.iter_rows(min_col=c, max_col=c, min_row=2, max_row=ws.max_row):
-                for cell in row:
-                    if cell.value:
-                        max_len = max(max_len, len(str(cell.value)))
-            ws.column_dimensions[get_column_letter(c)].width = min(max_len + 2, 50)
         tmp_dir = tempfile.mkdtemp(prefix="signcheck_xlsx_")
         tmp_path = os.path.join(tmp_dir, f"reconcile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        wb.save(tmp_path)
+        try:
+            write_xlsx_file(tmp_path, headers, rows, sheet_name="对账结果")
+        except RuntimeError:
+            raise HTTPException(500, "openpyxl 未安装")
         return FileResponse(
             path=tmp_path,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1124,30 +1035,13 @@ def export_endpoint(
         )
 
     if fmt == "html":
-        html_global_counts: Dict[str, int] = defaultdict(int)
-        for r in results:
-            html_global_counts[r.status] += 1
-        session_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for r in results:
-            session_counts[r.session][r.status] += 1
         target_sessions = sorted({r.session for r in results})
-        session_stats = []
-        for s in target_sessions:
-            counts = session_counts[s]
-            s_total = sum(counts.values())
-            row = {"session": s, "total": s_total}
-            for st in ["normal", "absent", "non_enrolled", "duplicate"]:
-                row[st] = counts.get(st, 0)
-            session_stats.append(row)
-        results_by_session = {}
-        for s in target_sessions:
-            results_by_session[s] = sorted(
-                [r for r in results if r.session == s],
-                key=lambda r: (r.status, r.name or ""),
-            )
-        html = _build_html_report(
+        global_stats, session_stats, results_by_session = build_session_stats_for_report(
+            results, target_sessions
+        )
+        html = build_html_report(
             title="签到报告 - API 导出",
-            global_stats=dict(html_global_counts),
+            global_stats=global_stats,
             session_stats=session_stats,
             results_by_session=results_by_session,
             generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

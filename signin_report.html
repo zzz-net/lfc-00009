@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>签到报告 - 全局汇总</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        background: #f5f7fa;
+        color: #303133;
+        line-height: 1.6;
+        padding: 24px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+        padding: 32px;
+        border-radius: 12px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 20px rgba(102, 126, 234, 0.3);
+    }
+    header h1 { font-size: 28px; margin-bottom: 8px; }
+    header .subtitle { opacity: 0.9; font-size: 14px; }
+    .card {
+        background: #fff;
+        border-radius: 10px;
+        padding: 24px;
+        margin-bottom: 20px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+    }
+    .card h2 {
+        font-size: 18px;
+        margin-bottom: 16px;
+        color: #303133;
+        border-left: 4px solid #667eea;
+        padding-left: 12px;
+    }
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 16px;
+        margin-bottom: 20px;
+    }
+    .stat-card {
+        padding: 16px;
+        border-radius: 8px;
+        text-align: center;
+        color: #fff;
+    }
+    .stat-card .num { font-size: 28px; font-weight: bold; }
+    .stat-card .label { font-size: 13px; opacity: 0.9; margin-top: 4px; }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }
+    th, td {
+        padding: 12px 16px;
+        text-align: left;
+        border-bottom: 1px solid #ebeef5;
+    }
+    th {
+        background: #fafafa;
+        font-weight: 600;
+        color: #606266;
+    }
+    tr:hover td { background: #fafbfc; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    th.num { text-align: right; }
+    .status-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: middle;
+    }
+    .status-badge {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 12px;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 500;
+    }
+    .muted { color: #909399; font-size: 12px; }
+    .detail-section { margin-bottom: 32px; }
+    .detail-section h2 {
+        font-size: 16px;
+        margin-bottom: 12px;
+    }
+    footer {
+        text-align: center;
+        color: #909399;
+        font-size: 13px;
+        padding: 24px;
+    }
+</style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>签到报告 - 全局汇总</h1>
+        <div class="subtitle">生成时间：2026-06-14 17:28:11　·　共 2 场次　·　10 条记录</div>
+    </header>
+
+    <div class="card">
+        <h2>全局汇总</h2>
+        <div class="stats-grid">
+            
+            <div class="stat-card" style="background: linear-gradient(135deg, #28a745, #20c997)">
+                <div class="num">4</div>
+                <div class="label">正常签到</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #dc3545, #e74c3c)">
+                <div class="num">4</div>
+                <div class="label">缺席</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #ffc107, #fd7e14)">
+                <div class="num">1</div>
+                <div class="label">非报名人员</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #6c757d, #495057)">
+                <div class="num">1</div>
+                <div class="label">重复扫码</div>
+            </div>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>状态</th>
+                    <th class="num">人数</th>
+                    <th class="num">占比</th>
+                </tr>
+            </thead>
+            <tbody>
+        <tr>
+            <td><span class="status-dot" style="background:#28a745"></span>正常签到</td>
+            <td class="num">4</td>
+            <td class="num">40.00%</td>
+        </tr>
+        <tr>
+            <td><span class="status-dot" style="background:#dc3545"></span>缺席</td>
+            <td class="num">4</td>
+            <td class="num">40.00%</td>
+        </tr>
+        <tr>
+            <td><span class="status-dot" style="background:#ffc107"></span>非报名人员</td>
+            <td class="num">1</td>
+            <td class="num">10.00%</td>
+        </tr>
+        <tr>
+            <td><span class="status-dot" style="background:#6c757d"></span>重复扫码</td>
+            <td class="num">1</td>
+            <td class="num">10.00%</td>
+        </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>按场次统计</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>场次</th>
+                    <th class="num">总计</th>
+                    <th class="num">占比</th>
+                    <th class="num">正常签到</th>
+                    <th class="num">缺席</th>
+                    <th class="num">非报名人员</th>
+                    <th class="num">重复扫码</th>
+                </tr>
+            </thead>
+            <tbody>
+        <tr>
+            <td><strong>上午场</strong></td>
+            <td class="num">6</td>
+            <td class="num muted">60.00%</td>
+            <td class="num"><span style="color:#28a745;font-weight:bold">2</span><br><span class="muted">33.33%</span></td><td class="num"><span style="color:#dc3545;font-weight:bold">2</span><br><span class="muted">33.33%</span></td><td class="num"><span style="color:#ffc107;font-weight:bold">1</span><br><span class="muted">16.67%</span></td><td class="num"><span style="color:#6c757d;font-weight:bold">1</span><br><span class="muted">16.67%</span></td>
+        </tr>
+        <tr>
+            <td><strong>下午场</strong></td>
+            <td class="num">4</td>
+            <td class="num muted">40.00%</td>
+            <td class="num"><span style="color:#28a745;font-weight:bold">2</span><br><span class="muted">50.00%</span></td><td class="num"><span style="color:#dc3545;font-weight:bold">2</span><br><span class="muted">50.00%</span></td><td class="num"><span style="color:#ffc107;font-weight:bold">0</span><br><span class="muted">0.00%</span></td><td class="num"><span style="color:#6c757d;font-weight:bold">0</span><br><span class="muted">0.00%</span></td>
+        </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        
+        <section class="detail-section">
+            <h2>场次详情：上午场 <span class="muted">（6 人）</span></h2>
+            <table class="detail-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>姓名</th>
+                        <th>手机号</th>
+                        <th>状态</th>
+                        <th>人工标记</th>
+                        <th>备注</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    
+            <tr>
+                <td class="num">6</td>
+                <td>吴九</td>
+                <td>13800007777</td>
+                <td><span class="status-badge" style="background:#dc3545">缺席</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">5</td>
+                <td>孙七</td>
+                <td>13800005555</td>
+                <td><span class="status-badge" style="background:#dc3545">缺席</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">3</td>
+                <td>张三</td>
+                <td>13800001111</td>
+                <td><span class="status-badge" style="background:#6c757d">重复扫码</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">1</td>
+                <td>钱外</td>
+                <td>13800009999</td>
+                <td><span class="status-badge" style="background:#ffc107">非报名人员</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">2</td>
+                <td>张三</td>
+                <td>13800001111</td>
+                <td><span class="status-badge" style="background:#28a745">正常签到</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">4</td>
+                <td>李四</td>
+                <td>13800002222</td>
+                <td><span class="status-badge" style="background:#28a745">正常签到</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+                </tbody>
+            </table>
+        </section>
+        <section class="detail-section">
+            <h2>场次详情：下午场 <span class="muted">（4 人）</span></h2>
+            <table class="detail-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>姓名</th>
+                        <th>手机号</th>
+                        <th>状态</th>
+                        <th>人工标记</th>
+                        <th>备注</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    
+            <tr>
+                <td class="num">9</td>
+                <td>周八</td>
+                <td>13800006666</td>
+                <td><span class="status-badge" style="background:#dc3545">缺席</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">10</td>
+                <td>郑十</td>
+                <td>13800008888</td>
+                <td><span class="status-badge" style="background:#dc3545">缺席</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">7</td>
+                <td>王五</td>
+                <td>13800003333</td>
+                <td><span class="status-badge" style="background:#28a745">正常签到</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td class="num">8</td>
+                <td>赵六</td>
+                <td>13800004444</td>
+                <td><span class="status-badge" style="background:#28a745">正常签到</span></td>
+                <td>-</td>
+                <td>-</td>
+            </tr>
+                </tbody>
+            </table>
+        </section>
+    </div>
+
+    <footer>
+        由 signcheck 签到对账工具生成
+    </footer>
+</div>
+</body>
+</html>

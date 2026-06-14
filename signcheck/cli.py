@@ -10,78 +10,54 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from collections import defaultdict
 
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils import get_column_letter
-    HAS_OPENPYXL = True
-except ImportError:
-    HAS_OPENPYXL = False
-
 from .models import (
     EnrollmentRecord,
     SigninRecord,
-    MatchRule,
-    FieldMapping,
-    ImportErrorRecord,
 )
 from .storage import Storage
 from .reconcile import reconcile, undo, mark_result, batch_mark
-from .handoff import create_handoff, export_handoff, import_handoff, verify_handoff
 from . import config as config_module
+from .constants import STATUS_LABELS, VALID_STATUSES
+from .csv_utils import read_csv_file
+from .import_service import (
+    import_enrollments,
+    import_signins,
+    import_rules,
+    get_enroll_mapping,
+    get_signin_mapping,
+)
+from .export_service import (
+    compute_status_counts,
+    format_csv_content,
+    write_csv_file,
+    build_json_data,
+    write_json_file,
+    write_xlsx_file,
+    build_results_xlsx_rows,
+    build_html_report,
+    build_session_stats_for_report,
+    calc_percentage,
+    build_stats_rows,
+)
+from .handoff_service import (
+    create_handoff,
+    export_handoff,
+    import_handoff,
+    verify_handoff,
+)
 
 
-VALID_STATUSES = {"normal", "absent", "non_enrolled", "duplicate"}
-
-STATUS_LABELS = {
-    "normal": "正常签到",
-    "absent": "缺席",
-    "non_enrolled": "非报名人员",
-    "duplicate": "重复扫码",
-}
-
-
-def _write_json(file_path: str, data: Any):
-    abs_path = os.path.abspath(file_path)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _validate_status(status: Optional[str]) -> Optional[str]:
+    if status is None:
+        return None
+    if status not in VALID_STATUSES:
+        click.echo(f"错误：非法状态「{status}」，可选值：{', '.join(sorted(VALID_STATUSES))}", err=True)
+        sys.exit(1)
+    return status
 
 
-def _write_xlsx(file_path: str, headers: List[str], rows: List[List[Any]], sheet_name: str = "Sheet1"):
-    if not HAS_OPENPYXL:
-        raise RuntimeError("openpyxl 未安装，请执行：pip install openpyxl>=3.1.0")
-    abs_path = os.path.abspath(file_path)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = sheet_name
-
-    bold_font = Font(bold=True)
-    center_align = Alignment(horizontal="center", vertical="center")
-
-    for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = bold_font
-        cell.alignment = center_align
-
-    for row_idx, row_data in enumerate(rows, start=2):
-        for col_idx, value in enumerate(row_data, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
-
-    ws.freeze_panes = "A2"
-
-    for col_idx in range(1, len(headers) + 1):
-        max_len = len(str(headers[col_idx - 1]))
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2, max_row=ws.max_row):
-            for cell in row:
-                if cell.value is not None:
-                    cell_len = len(str(cell.value))
-                    if cell_len > max_len:
-                        max_len = cell_len
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 50)
-
-    wb.save(abs_path)
+def _get_storage() -> Storage:
+    return Storage()
 
 
 def _resolve_filters(
@@ -128,42 +104,6 @@ def _resolve_filters(
     return filters
 
 
-def _validate_status(status: Optional[str]) -> Optional[str]:
-    if status is None:
-        return None
-    if status not in VALID_STATUSES:
-        click.echo(f"错误：非法状态「{status}」，可选值：{', '.join(sorted(VALID_STATUSES))}", err=True)
-        sys.exit(1)
-    return status
-
-
-def _get_storage() -> Storage:
-    return Storage()
-
-
-def _read_csv(file_path: str) -> tuple:
-    abs_path = os.path.abspath(file_path)
-    if not os.path.exists(abs_path):
-        click.echo(f"错误：文件不存在 {abs_path}", err=True)
-        sys.exit(1)
-    with open(abs_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    return rows, abs_path
-
-
-def _apply_field_mapping(rows: list, mapping: dict) -> list:
-    if not mapping:
-        return rows
-    mapped = []
-    for row in rows:
-        new_row = {}
-        for field_name, csv_col in mapping.items():
-            new_row[field_name] = row.get(csv_col, "").strip()
-        mapped.append(new_row)
-    return mapped
-
-
 @click.group()
 @click.version_option(version="1.0.0")
 def main():
@@ -177,83 +117,30 @@ def main():
 def import_enroll(csv_file: str, dry_run: bool):
     """导入报名 CSV 文件"""
     storage = _get_storage()
-    rows, abs_path = _read_csv(csv_file)
-    field_mapping = storage.get_field_mapping()
-    mapping = field_mapping.enroll if field_mapping.enroll else {
-        "name": "姓名",
-        "phone": "手机号",
-        "session": "场次",
-    }
+    rows, abs_path = read_csv_file(csv_file)
+    mapping = get_enroll_mapping(storage)
+    from .csv_utils import apply_field_mapping
+    mapped_rows = apply_field_mapping(rows, mapping)
 
-    mapped_rows = _apply_field_mapping(rows, mapping)
-
-    valid_records: List[EnrollmentRecord] = []
-    errors: List[ImportErrorRecord] = []
-    existing_sessions = storage.get_enrollment_sessions()
-
-    for idx, row in enumerate(mapped_rows):
-        source_row = idx + 2
-        name = row.get("name", "").strip()
-        phone = row.get("phone", "").strip() if row.get("phone") else ""
-        session = row.get("session", "").strip()
-
-        row_errors = []
-        if not phone:
-            row_errors.append(("missing_phone", f"第 {source_row} 行：手机号缺失"))
-        if not session:
-            row_errors.append(("missing_session", f"第 {source_row} 行：场次不能为空"))
-        if session and storage.is_session_closed(session):
-            row_errors.append(("session_closed", f"第 {source_row} 行：场次「{session}」已关闭，无法导入"))
-
-        if row_errors:
-            for error_type, error_msg in row_errors:
-                raw = json.dumps({k: v for k, v in row.items() if v}, ensure_ascii=False)
-                errors.append(ImportErrorRecord(
-                    source_type="enroll",
-                    source_file=os.path.basename(abs_path),
-                    row_number=source_row,
-                    error_type=error_type,
-                    error_message=error_msg,
-                    raw_data=raw,
-                ))
-            continue
-
-        valid_records.append(EnrollmentRecord(
-            name=name,
-            phone=phone,
-            session=session,
-            source_file=os.path.basename(abs_path),
-            source_row=source_row,
-        ))
+    result = import_enrollments(storage, mapped_rows, abs_path, dry_run=dry_run)
 
     if dry_run:
-        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(valid_records)} 条报名记录")
-        skipped = len(errors)
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(result.valid_records)} 条报名记录")
+        skipped = len(result.errors)
         if skipped:
             click.echo(f"[DRY-RUN] 跳过 {skipped} 条问题记录：")
-            for e in errors:
-                click.echo(f"  [ERR] {e.error_message}")
+            for e in result.errors:
+                click.echo(f"  [ERR] {e['error_message']}")
         else:
             click.echo("[DRY-RUN] 所有记录校验通过，无错误")
         storage.close()
         return
 
-    if valid_records:
-        new_ids, existing_ids = storage.add_enrollments(valid_records)
-        if new_ids:
-            undo_data = json.dumps({"action": "import_enroll", "ids": new_ids})
-            storage.add_undo_action("import_enroll", undo_data)
-    else:
-        new_ids, existing_ids = [], []
-
-    if errors:
-        storage.add_import_errors(errors)
-
-    click.echo(f"[OK] 新增 {len(new_ids)} 条报名记录，跳过 {len(existing_ids)} 条已存在记录")
-    if errors:
-        for e in errors:
-            click.echo(f"[ERR] {e.error_message}")
-        click.echo(f"共 {len(errors)} 条错误，已跳过")
+    click.echo(f"[OK] 新增 {len(result.new_ids)} 条报名记录，跳过 {len(result.existing_ids)} 条已存在记录")
+    if result.errors:
+        for e in result.errors:
+            click.echo(f"[ERR] {e['error_message']}")
+        click.echo(f"共 {len(result.errors)} 条错误，已跳过")
 
     storage.close()
 
@@ -264,86 +151,30 @@ def import_enroll(csv_file: str, dry_run: bool):
 def import_signin(csv_file: str, dry_run: bool):
     """导入扫码签到 CSV 文件"""
     storage = _get_storage()
-    rows, abs_path = _read_csv(csv_file)
-    field_mapping = storage.get_field_mapping()
-    mapping = field_mapping.signin if field_mapping.signin else {
-        "name": "姓名",
-        "phone": "手机号",
-        "session": "场次",
-        "scan_time": "扫码时间",
-    }
+    rows, abs_path = read_csv_file(csv_file)
+    mapping = get_signin_mapping(storage)
+    from .csv_utils import apply_field_mapping
+    mapped_rows = apply_field_mapping(rows, mapping)
 
-    mapped_rows = _apply_field_mapping(rows, mapping)
-
-    valid_records: List[SigninRecord] = []
-    errors: List[ImportErrorRecord] = []
-    existing_sessions = storage.get_enrollment_sessions()
-
-    for idx, row in enumerate(mapped_rows):
-        source_row = idx + 2
-        name = row.get("name", "").strip()
-        phone = row.get("phone", "").strip() if row.get("phone") else ""
-        session = row.get("session", "").strip()
-        scan_time = row.get("scan_time", "").strip() if row.get("scan_time") else ""
-
-        row_errors = []
-        if not phone:
-            row_errors.append(("missing_phone", f"第 {source_row} 行：手机号缺失"))
-        if existing_sessions and session and session not in existing_sessions:
-            row_errors.append(("invalid_session", f"第 {source_row} 行：场次「{session}」不存在"))
-        if session and storage.is_session_closed(session):
-            row_errors.append(("session_closed", f"第 {source_row} 行：场次「{session}」已关闭，无法导入"))
-
-        if row_errors:
-            for error_type, error_msg in row_errors:
-                raw = json.dumps({k: v for k, v in row.items() if v}, ensure_ascii=False)
-                errors.append(ImportErrorRecord(
-                    source_type="signin",
-                    source_file=os.path.basename(abs_path),
-                    row_number=source_row,
-                    error_type=error_type,
-                    error_message=error_msg,
-                    raw_data=raw,
-                ))
-            continue
-
-        valid_records.append(SigninRecord(
-            name=name,
-            phone=phone,
-            session=session,
-            scan_time=scan_time,
-            source_file=os.path.basename(abs_path),
-            source_row=source_row,
-        ))
+    result = import_signins(storage, mapped_rows, abs_path, dry_run=dry_run)
 
     if dry_run:
-        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(valid_records)} 条签到记录")
-        skipped = len(errors)
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(result.valid_records)} 条签到记录")
+        skipped = len(result.errors)
         if skipped:
             click.echo(f"[DRY-RUN] 跳过 {skipped} 条问题记录：")
-            for e in errors:
-                click.echo(f"  [ERR] {e.error_message}")
+            for e in result.errors:
+                click.echo(f"  [ERR] {e['error_message']}")
         else:
             click.echo("[DRY-RUN] 所有记录校验通过，无错误")
         storage.close()
         return
 
-    if valid_records:
-        new_ids, existing_ids = storage.add_signins(valid_records)
-        if new_ids:
-            undo_data = json.dumps({"action": "import_signin", "ids": new_ids})
-            storage.add_undo_action("import_signin", undo_data)
-    else:
-        new_ids, existing_ids = [], []
-
-    if errors:
-        storage.add_import_errors(errors)
-
-    click.echo(f"[OK] 新增 {len(new_ids)} 条签到记录，跳过 {len(existing_ids)} 条已存在记录")
-    if errors:
-        for e in errors:
-            click.echo(f"[ERR] {e.error_message}")
-        click.echo(f"共 {len(errors)} 条错误，已跳过")
+    click.echo(f"[OK] 新增 {len(result.new_ids)} 条签到记录，跳过 {len(result.existing_ids)} 条已存在记录")
+    if result.errors:
+        for e in result.errors:
+            click.echo(f"[ERR] {e['error_message']}")
+        click.echo(f"共 {len(result.errors)} 条错误，已跳过")
 
     storage.close()
 
@@ -351,7 +182,7 @@ def import_signin(csv_file: str, dry_run: bool):
 @main.command("import-rules")
 @click.argument("json_file")
 @click.option("--dry-run", is_flag=True, default=False, help="只校验不落库，预览导入结果")
-def import_rules(json_file: str, dry_run: bool):
+def import_rules_cmd(json_file: str, dry_run: bool):
     """导入匹配规则 JSON 文件"""
     storage = _get_storage()
     abs_path = os.path.abspath(json_file)
@@ -363,82 +194,33 @@ def import_rules(json_file: str, dry_run: bool):
         data = json.load(f)
 
     match_rules_data = data.get("match_rules", [])
-    rules: List[MatchRule] = []
-    errors: List[str] = []
-
-    for idx, r in enumerate(match_rules_data):
-        rule_idx = idx + 1
-        if "field" not in r:
-            errors.append(f"第 {rule_idx} 条规则：缺少 field 字段")
-            continue
-        field_name = r["field"]
-        match_type = r.get("match_type", "exact")
-        if match_type not in ("exact", "fuzzy"):
-            errors.append(f"第 {rule_idx} 条规则：match_type「{match_type}」不合法，可选 exact/fuzzy")
-            continue
-        threshold = r.get("threshold")
-        if match_type == "fuzzy" and threshold is None:
-            errors.append(f"第 {rule_idx} 条规则：fuzzy 匹配必须指定 threshold")
-            continue
-        rules.append(MatchRule(
-            field_name=field_name,
-            match_type=match_type,
-            threshold=threshold,
-            priority=r.get("priority", 0),
-        ))
-
     field_mapping_data = data.get("field_mapping", None)
-    if field_mapping_data:
-        if not isinstance(field_mapping_data, dict):
-            errors.append("field_mapping 必须是对象")
-        else:
-            for key in ("enroll", "signin"):
-                if key in field_mapping_data and not isinstance(field_mapping_data[key], dict):
-                    errors.append(f"field_mapping.{key} 必须是对象")
+
+    result = import_rules(
+        storage, match_rules_data, field_mapping_data, dry_run=dry_run, allow_contains=False
+    )
 
     if dry_run:
-        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(rules)} 条匹配规则")
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(result.rules)} 条匹配规则")
         if field_mapping_data:
             click.echo("[DRY-RUN] 将更新字段映射配置")
-        if errors:
-            click.echo(f"[DRY-RUN] 发现 {len(errors)} 个错误：")
-            for e in errors:
+        if result.errors:
+            click.echo(f"[DRY-RUN] 发现 {len(result.errors)} 个错误：")
+            for e in result.errors:
                 click.echo(f"  [ERR] {e}")
         else:
             click.echo("[DRY-RUN] 所有规则校验通过，无错误")
         storage.close()
         return
 
-    if errors:
-        click.echo(f"错误：校验未通过，共 {len(errors)} 个问题：", err=True)
-        for e in errors:
+    if result.errors:
+        click.echo(f"错误：校验未通过，共 {len(result.errors)} 个问题：", err=True)
+        for e in result.errors:
             click.echo(f"  [ERR] {e}", err=True)
         storage.close()
         sys.exit(1)
 
-    prev_rules = storage.get_all_rules()
-    prev_mapping = storage.get_field_mapping()
-
-    storage.clear_rules()
-
-    if rules:
-        storage.add_rules(rules)
-
-    if field_mapping_data:
-        fm = FieldMapping(
-            enroll=field_mapping_data.get("enroll", {}),
-            signin=field_mapping_data.get("signin", {}),
-        )
-        storage.save_field_mapping(fm)
-
-    undo_data = json.dumps({
-        "action": "import_rules",
-        "prev_rules": [{"field_name": r.field_name, "match_type": r.match_type, "threshold": r.threshold, "priority": r.priority} for r in prev_rules],
-        "prev_mapping": {"enroll": prev_mapping.enroll, "signin": prev_mapping.signin} if prev_mapping.enroll or prev_mapping.signin else None,
-    }, ensure_ascii=False)
-    storage.add_undo_action("import_rules", undo_data)
-
-    click.echo(f"[OK] 成功导入 {len(rules)} 条匹配规则")
+    click.echo(f"[OK] 成功导入 {len(result.rules)} 条匹配规则")
     if field_mapping_data:
         click.echo(f"[OK] 成功导入字段映射配置")
 
@@ -466,9 +248,7 @@ def do_reconcile():
     if skipped_sessions:
         click.echo(f"[提示] 已跳过 {len(skipped_sessions)} 个已关闭场次：{', '.join(skipped_sessions)}")
 
-    status_counts = {}
-    for r in results:
-        status_counts[r.status] = status_counts.get(r.status, 0) + 1
+    status_counts = compute_status_counts(results)
 
     click.echo("对账完成：")
     for status in ["normal", "absent", "non_enrolled", "duplicate"]:
@@ -645,7 +425,7 @@ def do_view_delete(name: str):
 def do_batch_mark(csv_file: str):
     """批量导入人工复核标记（CSV 格式：result_id, mark_text, notes）"""
     storage = _get_storage()
-    rows, abs_path = _read_csv(csv_file)
+    rows, abs_path = read_csv_file(csv_file)
 
     if not rows:
         click.echo("错误：CSV 文件为空", err=True)
@@ -720,73 +500,16 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
         output = base + default_ext
 
     abs_output = os.path.abspath(output)
-
-    status_counts = {}
-    for r in results:
-        status_counts[r.status] = status_counts.get(r.status, 0) + 1
+    status_counts = compute_status_counts(results)
 
     if fmt == "csv":
-        os.makedirs(os.path.dirname(abs_output), exist_ok=True)
-        with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"])
-            for r in results:
-                label = STATUS_LABELS.get(r.status, r.status)
-                writer.writerow([
-                    r.id,
-                    r.name,
-                    r.phone or "",
-                    r.session,
-                    label,
-                    r.manual_mark or "",
-                    r.notes or "",
-                ])
+        write_csv_file(abs_output, results)
     elif fmt == "json":
-        records = []
-        for r in results:
-            records.append({
-                "id": r.id,
-                "name": r.name,
-                "phone": r.phone,
-                "session": r.session,
-                "status": {
-                    "code": r.status,
-                    "label": STATUS_LABELS.get(r.status, r.status),
-                },
-                "manual_mark": r.manual_mark,
-                "notes": r.notes,
-                "references": {
-                    "enroll_id": r.enroll_id,
-                    "signin_id": r.signin_id,
-                },
-                "created_at": r.created_at,
-            })
-        json_data = {
-            "meta": {
-                "generated_at": datetime.now().isoformat(),
-                "total": len(results),
-                "status_summary": {
-                    STATUS_LABELS.get(s, s): c for s, c in status_counts.items()
-                },
-            },
-            "records": records,
-        }
-        _write_json(abs_output, json_data)
+        json_data = build_json_data(results, status_counts)
+        write_json_file(abs_output, json_data)
     elif fmt == "xlsx":
-        headers = ["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"]
-        rows = []
-        for r in results:
-            label = STATUS_LABELS.get(r.status, r.status)
-            rows.append([
-                r.id,
-                r.name,
-                r.phone or "",
-                r.session,
-                label,
-                r.manual_mark or "",
-                r.notes or "",
-            ])
-        _write_xlsx(abs_output, headers, rows, sheet_name="对账结果")
+        headers, rows = build_results_xlsx_rows(results)
+        write_xlsx_file(abs_output, headers, rows, sheet_name="对账结果")
 
     click.echo(f"[OK] 已导出 {len(results)} 条对账结果到 {abs_output}（格式：{fmt}）")
     click.echo("汇总：")
@@ -796,280 +519,6 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
         click.echo(f"  {label}: {cnt}")
 
     storage.close()
-
-
-def _escape_html(text: Optional[str]) -> str:
-    if text is None:
-        return ""
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
-
-
-def _build_html_report(
-    title: str,
-    global_stats: Dict[str, int],
-    session_stats: List[Dict[str, Any]],
-    results_by_session: Dict[str, List[Any]],
-    generated_at: str,
-) -> str:
-    status_colors = {
-        "normal": "#28a745",
-        "absent": "#dc3545",
-        "non_enrolled": "#ffc107",
-        "duplicate": "#6c757d",
-    }
-
-    total = sum(global_stats.values())
-    sessions_total = len(session_stats)
-
-    def _pct(cnt: int) -> str:
-        if total == 0:
-            return "0.00%"
-        return f"{cnt / total * 100:.2f}%"
-
-    global_summary_rows = ""
-    for status in ["normal", "absent", "non_enrolled", "duplicate"]:
-        cnt = global_stats.get(status, 0)
-        label = STATUS_LABELS.get(status, status)
-        color = status_colors.get(status, "#333")
-        global_summary_rows += f"""
-        <tr>
-            <td><span class="status-dot" style="background:{color}"></span>{_escape_html(label)}</td>
-            <td class="num">{cnt}</td>
-            <td class="num">{_pct(cnt)}</td>
-        </tr>"""
-
-    session_summary_rows = ""
-    for s in session_stats:
-        session_name = s["session"]
-        s_total = s["total"]
-        s_pct = f"{s_total / total * 100:.2f}%" if total > 0 else "0.00%"
-        cells = ""
-        for status in ["normal", "absent", "non_enrolled", "duplicate"]:
-            cnt = s.get(status, 0)
-            color = status_colors.get(status, "#333")
-            pct = f"{cnt / s_total * 100:.2f}%" if s_total > 0 else "0.00%"
-            cells += f'<td class="num"><span style="color:{color};font-weight:bold">{cnt}</span><br><span class="muted">{pct}</span></td>'
-        session_summary_rows += f"""
-        <tr>
-            <td><strong>{_escape_html(session_name)}</strong></td>
-            <td class="num">{s_total}</td>
-            <td class="num muted">{s_pct}</td>
-            {cells}
-        </tr>"""
-
-    detail_sections = ""
-    for session_name, results in results_by_session.items():
-        rows_html = ""
-        for r in results:
-            label = STATUS_LABELS.get(r.status, r.status)
-            color = status_colors.get(r.status, "#333")
-            rows_html += f"""
-            <tr>
-                <td class="num">{r.id}</td>
-                <td>{_escape_html(r.name)}</td>
-                <td>{_escape_html(r.phone)}</td>
-                <td><span class="status-badge" style="background:{color}">{_escape_html(label)}</span></td>
-                <td>{_escape_html(r.manual_mark) or "-"}</td>
-                <td>{_escape_html(r.notes) or "-"}</td>
-            </tr>"""
-        detail_sections += f"""
-        <section class="detail-section">
-            <h2>场次详情：{_escape_html(session_name)} <span class="muted">（{len(results)} 人）</span></h2>
-            <table class="detail-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>姓名</th>
-                        <th>手机号</th>
-                        <th>状态</th>
-                        <th>人工标记</th>
-                        <th>备注</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
-            </table>
-        </section>"""
-
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{_escape_html(title)}</title>
-<style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-        background: #f5f7fa;
-        color: #303133;
-        line-height: 1.6;
-        padding: 24px;
-    }}
-    .container {{ max-width: 1200px; margin: 0 auto; }}
-    header {{
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: #fff;
-        padding: 32px;
-        border-radius: 12px;
-        margin-bottom: 24px;
-        box-shadow: 0 4px 20px rgba(102, 126, 234, 0.3);
-    }}
-    header h1 {{ font-size: 28px; margin-bottom: 8px; }}
-    header .subtitle {{ opacity: 0.9; font-size: 14px; }}
-    .card {{
-        background: #fff;
-        border-radius: 10px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
-    }}
-    .card h2 {{
-        font-size: 18px;
-        margin-bottom: 16px;
-        color: #303133;
-        border-left: 4px solid #667eea;
-        padding-left: 12px;
-    }}
-    .stats-grid {{
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-        gap: 16px;
-        margin-bottom: 20px;
-    }}
-    .stat-card {{
-        padding: 16px;
-        border-radius: 8px;
-        text-align: center;
-        color: #fff;
-    }}
-    .stat-card .num {{ font-size: 28px; font-weight: bold; }}
-    .stat-card .label {{ font-size: 13px; opacity: 0.9; margin-top: 4px; }}
-    table {{
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 14px;
-    }}
-    th, td {{
-        padding: 12px 16px;
-        text-align: left;
-        border-bottom: 1px solid #ebeef5;
-    }}
-    th {{
-        background: #fafafa;
-        font-weight: 600;
-        color: #606266;
-    }}
-    tr:hover td {{ background: #fafbfc; }}
-    td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-    th.num {{ text-align: right; }}
-    .status-dot {{
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        margin-right: 8px;
-        vertical-align: middle;
-    }}
-    .status-badge {{
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 12px;
-        color: #fff;
-        font-size: 12px;
-        font-weight: 500;
-    }}
-    .muted {{ color: #909399; font-size: 12px; }}
-    .detail-section {{ margin-bottom: 32px; }}
-    .detail-section h2 {{
-        font-size: 16px;
-        margin-bottom: 12px;
-    }}
-    footer {{
-        text-align: center;
-        color: #909399;
-        font-size: 13px;
-        padding: 24px;
-    }}
-</style>
-</head>
-<body>
-<div class="container">
-    <header>
-        <h1>{_escape_html(title)}</h1>
-        <div class="subtitle">生成时间：{_escape_html(generated_at)}　·　共 {sessions_total} 场次　·　{total} 条记录</div>
-    </header>
-
-    <div class="card">
-        <h2>全局汇总</h2>
-        <div class="stats-grid">
-            <div class="stat-card" style="background: linear-gradient(135deg, #28a745, #20c997)">
-                <div class="num">{global_stats.get("normal", 0)}</div>
-                <div class="label">正常签到</div>
-            </div>
-            <div class="stat-card" style="background: linear-gradient(135deg, #dc3545, #e74c3c)">
-                <div class="num">{global_stats.get("absent", 0)}</div>
-                <div class="label">缺席</div>
-            </div>
-            <div class="stat-card" style="background: linear-gradient(135deg, #ffc107, #fd7e14)">
-                <div class="num">{global_stats.get("non_enrolled", 0)}</div>
-                <div class="label">非报名人员</div>
-            </div>
-            <div class="stat-card" style="background: linear-gradient(135deg, #6c757d, #495057)">
-                <div class="num">{global_stats.get("duplicate", 0)}</div>
-                <div class="label">重复扫码</div>
-            </div>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>状态</th>
-                    <th class="num">人数</th>
-                    <th class="num">占比</th>
-                </tr>
-            </thead>
-            <tbody>{global_summary_rows}
-            </tbody>
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>按场次统计</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>场次</th>
-                    <th class="num">总计</th>
-                    <th class="num">占比</th>
-                    <th class="num">正常签到</th>
-                    <th class="num">缺席</th>
-                    <th class="num">非报名人员</th>
-                    <th class="num">重复扫码</th>
-                </tr>
-            </thead>
-            <tbody>{session_summary_rows}
-            </tbody>
-        </table>
-    </div>
-
-    <div class="card">
-        {detail_sections}
-    </div>
-
-    <footer>
-        由 signcheck 签到对账工具生成
-    </footer>
-</div>
-</body>
-</html>"""
 
 
 @main.command("report")
@@ -1093,44 +542,24 @@ def do_report(output: str, session: Optional[str], fmt: str):
             click.echo(f"错误：场次「{session}」不存在，可用场次：{', '.join(all_sessions)}", err=True)
             storage.close()
             sys.exit(1)
-        results = [r for r in all_results if r.session == session]
         target_sessions = [session]
         title = f"签到报告 - {session}"
     else:
-        results = all_results
         target_sessions = all_sessions
         title = "签到报告 - 全局汇总"
 
-    global_stats: Dict[str, int] = defaultdict(int)
-    for r in results:
-        global_stats[r.status] += 1
+    results = [r for r in all_results if r.session in target_sessions]
 
-    session_status_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for r in results:
-        session_status_counts[r.session][r.status] += 1
-
-    session_stats: List[Dict[str, Any]] = []
-    for s in target_sessions:
-        counts = session_status_counts.get(s, {})
-        s_total = sum(counts.values())
-        row = {"session": s, "total": s_total}
-        for st in ["normal", "absent", "non_enrolled", "duplicate"]:
-            row[st] = counts.get(st, 0)
-        session_stats.append(row)
-
-    results_by_session: Dict[str, List[Any]] = {}
-    for s in target_sessions:
-        results_by_session[s] = sorted(
-            [r for r in results if r.session == s],
-            key=lambda r: (r.status, r.name or "")
-        )
+    global_stats, session_stats, results_by_session = build_session_stats_for_report(
+        results, target_sessions
+    )
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if fmt == "html":
-        html = _build_html_report(
+        html = build_html_report(
             title=title,
-            global_stats=dict(global_stats),
+            global_stats=global_stats,
             session_stats=session_stats,
             results_by_session=results_by_session,
             generated_at=generated_at,
@@ -1238,13 +667,13 @@ def do_backup(output_dir: str):
         meta_file = os.path.join(tmp_dir, "metadata.json")
         meta = snapshot.get("_meta", {})
         meta["filename"] = backup_name
-        _write_json(meta_file, meta)
+        write_json_file(meta_file, meta)
 
         for table_name in Storage.BACKUP_TABLES:
             rows = snapshot.get(table_name, [])
             if rows:
                 table_file = os.path.join(tmp_dir, f"{table_name}.json")
-                _write_json(table_file, rows)
+                write_json_file(table_file, rows)
 
         with zipfile.ZipFile(abs_output, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(meta_file, "metadata.json")
@@ -1358,33 +787,6 @@ def do_restore(backup_file: str, force: bool):
         storage.close()
 
 
-def _calc_percentage(count: int, total: int) -> str:
-    if total == 0:
-        return "0.00%"
-    return f"{count / total * 100:.2f}%"
-
-
-def _build_stats_rows(results: List[Dict[str, Any]], sessions: List[str]) -> List[Dict[str, Any]]:
-    session_status_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for r in results:
-        session_status_counts[r["session"]][r["status"]] = r["count"]
-
-    rows = []
-    for session in sessions:
-        counts = session_status_counts.get(session, {})
-        total = sum(counts.values())
-        row = {
-            "session": session,
-            "total": total,
-        }
-        for status in ["normal", "absent", "non_enrolled", "duplicate"]:
-            cnt = counts.get(status, 0)
-            row[status] = cnt
-            row[f"{status}_pct"] = _calc_percentage(cnt, total)
-        rows.append(row)
-    return rows
-
-
 def _print_stats_table(rows: List[Dict[str, Any]], show_global: bool = True):
     all_statuses = ["normal", "absent", "non_enrolled", "duplicate"]
 
@@ -1397,7 +799,7 @@ def _print_stats_table(rows: List[Dict[str, Any]], show_global: bool = True):
             global_row[status] = sum(r[status] for r in rows)
         total_all = global_row["total"]
         for status in all_statuses:
-            global_row[f"{status}_pct"] = _calc_percentage(global_row[status], total_all)
+            global_row[f"{status}_pct"] = calc_percentage(global_row[status], total_all)
         display_rows = rows + [global_row]
     else:
         display_rows = rows
@@ -1456,7 +858,7 @@ def do_stats(session: Optional[str], export: Optional[str], fmt: str):
         results = all_results
         sessions = all_sessions
 
-    stats_rows = _build_stats_rows(results, sessions)
+    stats_rows = build_stats_rows(results, sessions)
 
     if export is None:
         _print_stats_table(stats_rows, show_global=(session is None and len(sessions) > 1))
@@ -1485,13 +887,13 @@ def do_stats(session: Optional[str], export: Optional[str], fmt: str):
                 "合计",
                 total_all,
                 sum(r["normal"] for r in stats_rows),
-                _calc_percentage(sum(r["normal"] for r in stats_rows), total_all),
+                calc_percentage(sum(r["normal"] for r in stats_rows), total_all),
                 sum(r["absent"] for r in stats_rows),
-                _calc_percentage(sum(r["absent"] for r in stats_rows), total_all),
+                calc_percentage(sum(r["absent"] for r in stats_rows), total_all),
                 sum(r["non_enrolled"] for r in stats_rows),
-                _calc_percentage(sum(r["non_enrolled"] for r in stats_rows), total_all),
+                calc_percentage(sum(r["non_enrolled"] for r in stats_rows), total_all),
                 sum(r["duplicate"] for r in stats_rows),
-                _calc_percentage(sum(r["duplicate"] for r in stats_rows), total_all),
+                calc_percentage(sum(r["duplicate"] for r in stats_rows), total_all),
             ])
 
         if fmt == "csv":
@@ -1529,13 +931,13 @@ def do_stats(session: Optional[str], export: Optional[str], fmt: str):
                     "status": {
                         STATUS_LABELS[s]: {
                             "count": sum(r[s] for r in stats_rows),
-                            "percentage": _calc_percentage(sum(r[s] for r in stats_rows), total_all),
+                            "percentage": calc_percentage(sum(r[s] for r in stats_rows), total_all),
                         } for s in ["normal", "absent", "non_enrolled", "duplicate"]
                     },
                 }
-            _write_json(abs_output, json_data)
+            write_json_file(abs_output, json_data)
         elif fmt == "xlsx":
-            _write_xlsx(abs_output, headers, display_rows, sheet_name="场次统计")
+            write_xlsx_file(abs_output, headers, display_rows, sheet_name="场次统计")
 
         click.echo(f"[OK] 已导出 {len(stats_rows)} 场统计到 {abs_output}（格式：{fmt}）")
 

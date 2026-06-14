@@ -9,16 +9,9 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+from .constants import HANDOFF_CSV_ENROLL_HEADERS, HANDOFF_CSV_RESULT_HEADERS, HANDOFF_CSV_SIGNIN_HEADERS, STATUS_LABELS
 from .models import HandoffPackage, HandoffExportLog, HandoffAuditLog
 from .storage import Storage
-
-
-STATUS_LABELS = {
-    "normal": "正常签到",
-    "absent": "缺席",
-    "non_enrolled": "非报名人员",
-    "duplicate": "重复扫码",
-}
 
 
 def _generate_package_id(session: str) -> str:
@@ -29,76 +22,6 @@ def _generate_package_id(session: str) -> str:
 
 def _compute_data_hash(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-def create_handoff(
-    storage: Storage,
-    session: str,
-    operator: str,
-) -> Tuple[HandoffPackage, str]:
-    if not operator or not operator.strip():
-        raise ValueError("操作者不能为空，禁止生成交接包")
-
-    results = storage.query_reconcile_results(session=session)
-    if not results:
-        raise ValueError(f"场次「{session}」暂无对账结果，无法生成交接包")
-
-    enrollments = [e for e in storage.get_all_enrollments() if e.session == session]
-    signins = [s for s in storage.get_all_signins() if s.session == session]
-
-    status_counts: Dict[str, int] = defaultdict(int)
-    manual_mark_count = 0
-    for r in results:
-        status_counts[r.status] += 1
-        if r.manual_mark:
-            manual_mark_count += 1
-
-    status_summary = json.dumps(
-        {STATUS_LABELS.get(k, k): v for k, v in status_counts.items()},
-        ensure_ascii=False,
-    )
-
-    package_id = _generate_package_id(session)
-    generated_at = datetime.now().isoformat()
-
-    package_data = _build_package_json(
-        package_id=package_id,
-        session=session,
-        operator=operator,
-        generated_at=generated_at,
-        enrollments=enrollments,
-        signins=signins,
-        results=results,
-        status_summary=status_summary,
-        manual_mark_count=manual_mark_count,
-    )
-
-    data_hash = _compute_data_hash(package_data)
-
-    pkg = HandoffPackage(
-        package_id=package_id,
-        session=session,
-        operator=operator,
-        enroll_count=len(enrollments),
-        signin_count=len(signins),
-        result_count=len(results),
-        status_summary=status_summary,
-        manual_mark_count=manual_mark_count,
-        generated_at=generated_at,
-        data_hash=data_hash,
-    )
-
-    storage.add_handoff_package(pkg)
-
-    storage.add_handoff_audit_log(HandoffAuditLog(
-        operator=operator,
-        action="handoff_create",
-        target=package_id,
-        result="success",
-        detail=f"场次={session}, 记录数={len(results)}",
-    ))
-
-    return pkg, package_data
 
 
 def _build_package_json(
@@ -173,6 +96,106 @@ def _build_package_json(
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _write_csv_detail(tmp_dir: str, filename: str, records: list, record_type: str):
+    filepath = os.path.join(tmp_dir, filename)
+    with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        if record_type == "enroll":
+            writer.writerow(HANDOFF_CSV_ENROLL_HEADERS)
+            for e in records:
+                writer.writerow([e.id, e.name, e.phone or "", e.session, e.source_file or "", e.source_row or ""])
+        elif record_type == "signin":
+            writer.writerow(HANDOFF_CSV_SIGNIN_HEADERS)
+            for s in records:
+                writer.writerow([s.id, s.name, s.phone or "", s.session, s.scan_time or "", s.source_file or "", s.source_row or ""])
+        elif record_type == "result":
+            writer.writerow(HANDOFF_CSV_RESULT_HEADERS)
+            for r in records:
+                writer.writerow([
+                    r.id, r.enroll_id or "", r.signin_id or "",
+                    r.name, r.phone or "", r.session,
+                    r.status, STATUS_LABELS.get(r.status, r.status),
+                    r.manual_mark or "", r.notes or "",
+                ])
+
+
+def write_audit_log(storage: Storage, operator: str, action: str, target: str, result: str, detail: Optional[str] = None) -> int:
+    return storage.add_handoff_audit_log(HandoffAuditLog(
+        operator=operator,
+        action=action,
+        target=target,
+        result=result,
+        detail=detail,
+    ))
+
+
+def create_handoff(
+    storage: Storage,
+    session: str,
+    operator: str,
+) -> Tuple[HandoffPackage, str]:
+    if not operator or not operator.strip():
+        raise ValueError("操作者不能为空，禁止生成交接包")
+
+    results = storage.query_reconcile_results(session=session)
+    if not results:
+        raise ValueError(f"场次「{session}」暂无对账结果，无法生成交接包")
+
+    enrollments = [e for e in storage.get_all_enrollments() if e.session == session]
+    signins = [s for s in storage.get_all_signins() if s.session == session]
+
+    status_counts: Dict[str, int] = defaultdict(int)
+    manual_mark_count = 0
+    for r in results:
+        status_counts[r.status] += 1
+        if r.manual_mark:
+            manual_mark_count += 1
+
+    status_summary = json.dumps(
+        {STATUS_LABELS.get(k, k): v for k, v in status_counts.items()},
+        ensure_ascii=False,
+    )
+
+    package_id = _generate_package_id(session)
+    generated_at = datetime.now().isoformat()
+
+    package_data = _build_package_json(
+        package_id=package_id,
+        session=session,
+        operator=operator,
+        generated_at=generated_at,
+        enrollments=enrollments,
+        signins=signins,
+        results=results,
+        status_summary=status_summary,
+        manual_mark_count=manual_mark_count,
+    )
+
+    data_hash = _compute_data_hash(package_data)
+
+    pkg = HandoffPackage(
+        package_id=package_id,
+        session=session,
+        operator=operator,
+        enroll_count=len(enrollments),
+        signin_count=len(signins),
+        result_count=len(results),
+        status_summary=status_summary,
+        manual_mark_count=manual_mark_count,
+        generated_at=generated_at,
+        data_hash=data_hash,
+    )
+
+    storage.add_handoff_package(pkg)
+
+    write_audit_log(
+        storage, operator, "handoff_create", package_id, "success",
+        f"场次={session}, 记录数={len(results)}",
+    )
+
+    return pkg, package_data
+
+
 def export_handoff(
     storage: Storage,
     package_id: str,
@@ -240,38 +263,12 @@ def export_handoff(
         operator=operator,
     ))
 
-    storage.add_handoff_audit_log(HandoffAuditLog(
-        operator=operator,
-        action="handoff_export",
-        target=package_id,
-        result="success",
-        detail=f"导出路径={abs_output}",
-    ))
+    write_audit_log(
+        storage, operator, "handoff_export", package_id, "success",
+        f"导出路径={abs_output}",
+    )
 
     return abs_output
-
-
-def _write_csv_detail(tmp_dir: str, filename: str, records: list, record_type: str):
-    filepath = os.path.join(tmp_dir, filename)
-    with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        if record_type == "enroll":
-            writer.writerow(["ID", "姓名", "手机号", "场次", "来源文件", "来源行号"])
-            for e in records:
-                writer.writerow([e.id, e.name, e.phone or "", e.session, e.source_file or "", e.source_row or ""])
-        elif record_type == "signin":
-            writer.writerow(["ID", "姓名", "手机号", "场次", "扫码时间", "来源文件", "来源行号"])
-            for s in records:
-                writer.writerow([s.id, s.name, s.phone or "", s.session, s.scan_time or "", s.source_file or "", s.source_row or ""])
-        elif record_type == "result":
-            writer.writerow(["ID", "报名ID", "签到ID", "姓名", "手机号", "场次", "状态", "状态标签", "人工标记", "备注"])
-            for r in records:
-                writer.writerow([
-                    r.id, r.enroll_id or "", r.signin_id or "",
-                    r.name, r.phone or "", r.session,
-                    r.status, STATUS_LABELS.get(r.status, r.status),
-                    r.manual_mark or "", r.notes or "",
-                ])
 
 
 def verify_handoff(zip_path: str) -> Tuple[bool, List[str]]:
@@ -339,13 +336,10 @@ def import_handoff(
 
     valid, verify_errors = verify_handoff(abs_path)
     if not valid:
-        storage.add_handoff_audit_log(HandoffAuditLog(
-            operator=operator,
-            action="handoff_import",
-            target=abs_path,
-            result="failed",
-            detail="校验失败：" + "; ".join(verify_errors),
-        ))
+        write_audit_log(
+            storage, operator, "handoff_import", abs_path, "failed",
+            "校验失败：" + "; ".join(verify_errors),
+        )
         raise ValueError("交接包校验失败：" + "; ".join(verify_errors))
 
     tmp_dir = tempfile.mkdtemp(prefix="signcheck_handoff_import_")
@@ -368,46 +362,34 @@ def import_handoff(
 
         if existing is not None:
             if not overwrite:
-                storage.add_handoff_audit_log(HandoffAuditLog(
-                    operator=operator,
-                    action="handoff_import",
-                    target=package_id,
-                    result="rejected",
-                    detail=f"包编号冲突：{package_id} 已存在，使用 --overwrite 允许覆盖",
-                ))
+                write_audit_log(
+                    storage, operator, "handoff_import", package_id, "rejected",
+                    f"包编号冲突：{package_id} 已存在，使用 --overwrite 允许覆盖",
+                )
                 raise ValueError(f"包编号冲突：「{package_id}」已存在，使用 --overwrite 允许覆盖")
 
             storage.delete_handoff_package(package_id)
-            storage.add_handoff_audit_log(HandoffAuditLog(
-                operator=operator,
-                action="handoff_import_overwrite",
-                target=package_id,
-                result="success",
-                detail=f"覆盖已存在的包编号：{package_id}",
-            ))
+            write_audit_log(
+                storage, operator, "handoff_import_overwrite", package_id, "success",
+                f"覆盖已存在的包编号：{package_id}",
+            )
 
         if not existing and session_conflict:
             existing_session_pkg = session_conflict[0]
             if not overwrite:
-                storage.add_handoff_audit_log(HandoffAuditLog(
-                    operator=operator,
-                    action="handoff_import",
-                    target=package_id,
-                    result="rejected",
-                    detail=f"场次名冲突：场次「{session}」已有交接包 {existing_session_pkg.package_id}，使用 --overwrite 允许覆盖",
-                ))
+                write_audit_log(
+                    storage, operator, "handoff_import", package_id, "rejected",
+                    f"场次名冲突：场次「{session}」已有交接包 {existing_session_pkg.package_id}，使用 --overwrite 允许覆盖",
+                )
                 raise ValueError(
                     f"场次名冲突：场次「{session}」已有交接包 {existing_session_pkg.package_id}，使用 --overwrite 允许覆盖"
                 )
 
             storage.delete_handoff_package(existing_session_pkg.package_id)
-            storage.add_handoff_audit_log(HandoffAuditLog(
-                operator=operator,
-                action="handoff_import_overwrite",
-                target=existing_session_pkg.package_id,
-                result="success",
-                detail=f"覆盖场次「{session}」已有交接包",
-            ))
+            write_audit_log(
+                storage, operator, "handoff_import_overwrite", existing_session_pkg.package_id, "success",
+                f"覆盖场次「{session}」已有交接包",
+            )
 
         summary = manifest_data.get("summary", {})
         pkg = HandoffPackage(
@@ -425,13 +407,10 @@ def import_handoff(
 
         storage.add_handoff_package(pkg)
 
-        storage.add_handoff_audit_log(HandoffAuditLog(
-            operator=operator,
-            action="handoff_import",
-            target=package_id,
-            result="success",
-            detail=f"场次={session}, 记录数={summary.get('result_count', 0)}",
-        ))
+        write_audit_log(
+            storage, operator, "handoff_import", package_id, "success",
+            f"场次={session}, 记录数={summary.get('result_count', 0)}",
+        )
 
         return {
             "package_id": package_id,
