@@ -109,3 +109,39 @@ class NotificationLog:
     message: Optional[str] = None
     retries: int = 0
     created_at: Optional[str] = None
+
+
+@dataclass
+class HandoffPackage:
+    id: Optional[int] = None
+    package_id: str = ""
+    session: str = ""
+    operator: str = ""
+    enroll_count: int = 0
+    signin_count: int = 0
+    result_count: int = 0
+    status_summary: str = ""
+    manual_mark_count: int = 0
+    generated_at: Optional[str] = None
+    data_hash: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class HandoffExportLog:
+    id: Optional[int] = None
+    package_id: str = ""
+    export_path: str = ""
+    operator: str = ""
+    exported_at: Optional[str] = None
+
+
+@dataclass
+class HandoffAuditLog:
+    id: Optional[int] = None
+    operator: str = ""
+    action: str = ""
+    target: str = ""
+    result: str = ""
+    detail: Optional[str] = None
+    created_at: Optional[str] = None

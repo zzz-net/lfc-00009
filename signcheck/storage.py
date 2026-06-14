@@ -14,6 +14,9 @@ from .models import (
     SessionRecord,
     NotificationRule,
     NotificationLog,
+    HandoffPackage,
+    HandoffExportLog,
+    HandoffAuditLog,
 )
 
 def _resolve_db_dir():
@@ -132,6 +135,39 @@ CREATE TABLE IF NOT EXISTS notification_log (
     status TEXT NOT NULL,
     message TEXT,
     retries INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS handoff_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id TEXT NOT NULL UNIQUE,
+    session TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    enroll_count INTEGER NOT NULL DEFAULT 0,
+    signin_count INTEGER NOT NULL DEFAULT 0,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    status_summary TEXT NOT NULL DEFAULT '',
+    manual_mark_count INTEGER NOT NULL DEFAULT 0,
+    generated_at TEXT NOT NULL,
+    data_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS handoff_export_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id TEXT NOT NULL,
+    export_path TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    exported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS handoff_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operator TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    result TEXT NOT NULL,
+    detail TEXT,
     created_at TEXT NOT NULL
 );
 """
@@ -693,6 +729,9 @@ class Storage:
         "sessions",
         "notification_rules",
         "notification_log",
+        "handoff_packages",
+        "handoff_export_log",
+        "handoff_audit_log",
     ]
 
     def export_all(self) -> Dict[str, Any]:
@@ -801,3 +840,69 @@ class Storage:
     def get_notification_logs_by_session(self, session: str, limit: int = 100) -> List[NotificationLog]:
         rows = self.conn.execute("SELECT * FROM notification_log WHERE session=? ORDER BY id DESC LIMIT ?", (session, limit)).fetchall()
         return [NotificationLog(**dict(r)) for r in rows]
+
+    # ── Handoff Packages ─────────────────────────────────────
+
+    def add_handoff_package(self, pkg: HandoffPackage) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO handoff_packages (package_id,session,operator,enroll_count,signin_count,result_count,status_summary,manual_mark_count,generated_at,data_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (pkg.package_id, pkg.session, pkg.operator, pkg.enroll_count, pkg.signin_count, pkg.result_count, pkg.status_summary, pkg.manual_mark_count, pkg.generated_at, pkg.data_hash, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_handoff_package(self, package_id: str) -> Optional[HandoffPackage]:
+        row = self.conn.execute("SELECT * FROM handoff_packages WHERE package_id=?", (package_id,)).fetchone()
+        if row is None:
+            return None
+        return HandoffPackage(**dict(row))
+
+    def get_handoff_packages_by_session(self, session: str) -> List[HandoffPackage]:
+        rows = self.conn.execute("SELECT * FROM handoff_packages WHERE session=? ORDER BY created_at DESC", (session,)).fetchall()
+        return [HandoffPackage(**dict(r)) for r in rows]
+
+    def get_all_handoff_packages(self) -> List[HandoffPackage]:
+        rows = self.conn.execute("SELECT * FROM handoff_packages ORDER BY created_at DESC").fetchall()
+        return [HandoffPackage(**dict(r)) for r in rows]
+
+    def delete_handoff_package(self, package_id: str) -> bool:
+        cur = self.conn.execute("DELETE FROM handoff_packages WHERE package_id=?", (package_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def find_handoff_package_conflict(self, session: str, package_id: str) -> Optional[HandoffPackage]:
+        row = self.conn.execute("SELECT * FROM handoff_packages WHERE session=? OR package_id=?", (session, package_id)).fetchone()
+        if row is None:
+            return None
+        return HandoffPackage(**dict(row))
+
+    # ── Handoff Export Log ────────────────────────────────────
+
+    def add_handoff_export_log(self, log: HandoffExportLog) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO handoff_export_log (package_id,export_path,operator,exported_at) VALUES (?,?,?,?)",
+            (log.package_id, log.export_path, log.operator, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_handoff_export_logs(self, package_id: Optional[str] = None) -> List[HandoffExportLog]:
+        if package_id:
+            rows = self.conn.execute("SELECT * FROM handoff_export_log WHERE package_id=? ORDER BY id DESC", (package_id,)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM handoff_export_log ORDER BY id DESC").fetchall()
+        return [HandoffExportLog(**dict(r)) for r in rows]
+
+    # ── Handoff Audit Log ────────────────────────────────────
+
+    def add_handoff_audit_log(self, log: HandoffAuditLog) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO handoff_audit_log (operator,action,target,result,detail,created_at) VALUES (?,?,?,?,?,?)",
+            (log.operator, log.action, log.target, log.result, log.detail, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_handoff_audit_logs(self, limit: int = 100) -> List[HandoffAuditLog]:
+        rows = self.conn.execute("SELECT * FROM handoff_audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [HandoffAuditLog(**dict(r)) for r in rows]

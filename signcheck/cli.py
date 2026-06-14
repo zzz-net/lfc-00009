@@ -27,6 +27,7 @@ from .models import (
 )
 from .storage import Storage
 from .reconcile import reconcile, undo, mark_result, batch_mark
+from .handoff import create_handoff, export_handoff, import_handoff, verify_handoff
 from . import config as config_module
 
 
@@ -1662,6 +1663,164 @@ def config_reset():
     click.echo("当前配置：")
     for key in sorted(cfg.keys()):
         click.echo(f"  {key}: {cfg[key]}")
+
+
+@main.group("handoff")
+def handoff_group():
+    """场次交接包管理"""
+    pass
+
+
+@handoff_group.command("create")
+@click.argument("session")
+@click.option("--operator", "-o", required=True, help="操作者（必填）")
+def handoff_create(session: str, operator: str):
+    """从已对账场次生成交接包"""
+    if not operator or not operator.strip():
+        click.echo("错误：操作者不能为空，禁止生成交接包", err=True)
+        sys.exit(1)
+
+    storage = _get_storage()
+    try:
+        pkg, _ = create_handoff(storage, session, operator)
+        click.echo(f"[OK] 交接包已生成")
+        click.echo(f"  包编号: {pkg.package_id}")
+        click.echo(f"  场次: {pkg.session}")
+        click.echo(f"  操作者: {pkg.operator}")
+        click.echo(f"  报名数: {pkg.enroll_count}")
+        click.echo(f"  签到数: {pkg.signin_count}")
+        click.echo(f"  对账结果数: {pkg.result_count}")
+        click.echo(f"  人工标记数: {pkg.manual_mark_count}")
+        click.echo(f"  生成时间: {pkg.generated_at}")
+        summary = json.loads(pkg.status_summary)
+        for label, count in summary.items():
+            click.echo(f"  {label}: {count}")
+    except ValueError as e:
+        click.echo(f"错误：{e}", err=True)
+        storage.close()
+        sys.exit(1)
+    storage.close()
+
+
+@handoff_group.command("list")
+@click.option("--session", default=None, help="按场次筛选")
+def handoff_list(session: Optional[str]):
+    """列出所有交接包"""
+    storage = _get_storage()
+    if session:
+        packages = storage.get_handoff_packages_by_session(session)
+    else:
+        packages = storage.get_all_handoff_packages()
+
+    if not packages:
+        click.echo("暂无交接包")
+        storage.close()
+        return
+
+    col_widths = {
+        "package_id": max(8, max(len(p.package_id) for p in packages)),
+        "session": max(4, max(len(p.session) for p in packages)),
+        "operator": max(4, max(len(p.operator) for p in packages)),
+        "results": max(4, max(len(str(p.result_count)) for p in packages)),
+        "generated": max(8, max(len(p.generated_at or "-") for p in packages)),
+    }
+
+    header = (
+        f"{'包编号':<{col_widths['package_id']}}  "
+        f"{'场次':<{col_widths['session']}}  "
+        f"{'操作者':<{col_widths['operator']}}  "
+        f"{'结果数':<{col_widths['results']}}  "
+        f"{'生成时间':<{col_widths['generated']}}"
+    )
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for p in packages:
+        row = (
+            f"{p.package_id:<{col_widths['package_id']}}  "
+            f"{p.session:<{col_widths['session']}}  "
+            f"{p.operator:<{col_widths['operator']}}  "
+            f"{str(p.result_count):<{col_widths['results']}}  "
+            f"{p.generated_at or '-':<{col_widths['generated']}}"
+        )
+        click.echo(row)
+
+    click.echo(f"\n共 {len(packages)} 个交接包")
+    storage.close()
+
+
+@handoff_group.command("export")
+@click.argument("package_id")
+@click.option("--output", "-o", required=True, help="输出 zip 文件路径")
+@click.option("--operator", "-p", required=True, help="操作者（必填）")
+def handoff_export(package_id: str, output: str, operator: str):
+    """导出交接包为 zip 文件（含 JSON 清单和 CSV 明细）"""
+    if not operator or not operator.strip():
+        click.echo("错误：操作者不能为空，禁止导出交接包", err=True)
+        sys.exit(1)
+
+    storage = _get_storage()
+    try:
+        abs_output = export_handoff(storage, package_id, output, operator)
+        click.echo(f"[OK] 交接包已导出到 {abs_output}")
+        click.echo(f"  包编号: {package_id}")
+        click.echo(f"  包含文件: manifest.json, enrollments.csv, signins.csv, reconcile_results.csv, checksums.json")
+    except ValueError as e:
+        click.echo(f"错误：{e}", err=True)
+        storage.close()
+        sys.exit(1)
+    storage.close()
+
+
+@handoff_group.command("import")
+@click.argument("zip_file")
+@click.option("--operator", "-o", required=True, help="操作者（必填）")
+@click.option("--overwrite", is_flag=True, default=False, help="允许覆盖已有交接包")
+def handoff_import(zip_file: str, operator: str, overwrite: bool):
+    """导入交接包 zip 文件"""
+    if not operator or not operator.strip():
+        click.echo("错误：操作者不能为空，禁止导入交接包", err=True)
+        sys.exit(1)
+
+    storage = _get_storage()
+    try:
+        result = import_handoff(storage, zip_file, operator, overwrite=overwrite)
+        click.echo(f"[OK] 交接包已导入")
+        click.echo(f"  包编号: {result['package_id']}")
+        click.echo(f"  场次: {result['session']}")
+        click.echo(f"  报名数: {result['enroll_count']}")
+        click.echo(f"  签到数: {result['signin_count']}")
+        click.echo(f"  对账结果数: {result['result_count']}")
+        click.echo(f"  人工标记数: {result['manual_mark_count']}")
+        if result['overwritten']:
+            click.echo(f"  覆盖模式: 是（已写入审计日志）")
+    except ValueError as e:
+        click.echo(f"错误：{e}", err=True)
+        storage.close()
+        sys.exit(1)
+    storage.close()
+
+
+@handoff_group.command("verify")
+@click.argument("zip_file")
+def handoff_verify(zip_file: str):
+    """校验交接包文件完整性（hash 校验）"""
+    storage = _get_storage()
+    try:
+        valid, errors = verify_handoff(zip_file)
+        if valid:
+            click.echo("[OK] 交接包校验通过，所有文件 hash 一致")
+        else:
+            click.echo("校验失败，发现以下问题：", err=True)
+            for err in errors:
+                click.echo(f"  [ERR] {err}", err=True)
+            storage.close()
+            sys.exit(1)
+    except ValueError as e:
+        click.echo(f"错误：{e}", err=True)
+        storage.close()
+        sys.exit(1)
+    storage.close()
 
 
 if __name__ == "__main__":
