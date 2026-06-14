@@ -11,7 +11,7 @@ from .storage import Storage
 from .matcher import build_enrollment_lookup, find_match
 
 
-def reconcile(storage: Storage) -> List[ReconcileResult]:
+def reconcile(storage: Storage) -> Tuple[List[ReconcileResult], List[str]]:
     enrollments = storage.get_all_enrollments()
     signins = storage.get_all_signins()
     rules = storage.get_all_rules()
@@ -24,18 +24,29 @@ def reconcile(storage: Storage) -> List[ReconcileResult]:
 
     storage.clear_reconcile_results()
 
+    all_sessions = storage.get_session_names()
+    closed_sessions = set()
+    if all_sessions:
+        for s in all_sessions:
+            if storage.is_session_closed(s):
+                closed_sessions.add(s)
+
     enroll_by_session: Dict[str, List[EnrollmentRecord]] = defaultdict(list)
     for e in enrollments:
+        if e.session in closed_sessions:
+            continue
         enroll_by_session[e.session].append(e)
 
     signin_by_session: Dict[str, List[SigninRecord]] = defaultdict(list)
     for s in signins:
+        if s.session in closed_sessions:
+            continue
         signin_by_session[s.session].append(s)
 
-    all_sessions = set(enroll_by_session.keys()) | set(signin_by_session.keys())
+    all_sessions_set = set(enroll_by_session.keys()) | set(signin_by_session.keys())
     results: List[ReconcileResult] = []
 
-    for session in sorted(all_sessions):
+    for session in sorted(all_sessions_set):
         session_enrolls = enroll_by_session.get(session, [])
         session_signins = signin_by_session.get(session, [])
 
@@ -95,7 +106,7 @@ def reconcile(storage: Storage) -> List[ReconcileResult]:
     }, ensure_ascii=False)
     storage.add_undo_action("reconcile", undo_data)
 
-    return results
+    return results, list(closed_sessions)
 
 
 def _default_rules() -> List[MatchRule]:

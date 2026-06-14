@@ -11,6 +11,7 @@ from .models import (
     ImportErrorRecord,
     UndoAction,
     FieldMapping,
+    SessionRecord,
 )
 
 def _resolve_db_dir():
@@ -96,6 +97,17 @@ CREATE TABLE IF NOT EXISTS saved_views (
     filters TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'open',
+    start_time TEXT,
+    end_time TEXT,
+    description TEXT,
+    created_at TEXT NOT NULL,
+    closed_at TEXT
 );
 """
 
@@ -570,6 +582,57 @@ class Storage:
     def get_undo_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) as cnt FROM undo_history").fetchone()
         return row["cnt"]
+
+    # ── Sessions ───────────────────────────────────────────────
+
+    def create_session(
+        self,
+        name: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Optional[int]:
+        existing = self.conn.execute("SELECT id FROM sessions WHERE name=?", (name,)).fetchone()
+        if existing:
+            return None
+        cur = self.conn.execute(
+            "INSERT INTO sessions (name, status, start_time, end_time, description, created_at) VALUES (?, 'open', ?, ?, ?, ?)",
+            (name, start_time, end_time, description, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_session(self, name: str) -> Optional[SessionRecord]:
+        row = self.conn.execute("SELECT * FROM sessions WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return None
+        return SessionRecord(**dict(row))
+
+    def get_all_sessions(self) -> List[SessionRecord]:
+        rows = self.conn.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+        return [SessionRecord(**dict(r)) for r in rows]
+
+    def close_session(self, name: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE sessions SET status='closed', closed_at=? WHERE name=? AND status='open'",
+            (self._now(), name),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def is_session_closed(self, name: str) -> bool:
+        row = self.conn.execute("SELECT status FROM sessions WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return False
+        return row["status"] == "closed"
+
+    def get_open_sessions(self) -> List[str]:
+        rows = self.conn.execute("SELECT name FROM sessions WHERE status='open' ORDER BY name").fetchall()
+        return [r["name"] for r in rows]
+
+    def get_session_names(self) -> List[str]:
+        rows = self.conn.execute("SELECT name FROM sessions ORDER BY name").fetchall()
+        return [r["name"] for r in rows]
 
     # ── Statistics ─────────────────────────────────────────────
 

@@ -72,3 +72,15 @@ class UndoAction:
 class FieldMapping:
     enroll: dict = field(default_factory=dict)
     signin: dict = field(default_factory=dict)
+
+
+@dataclass
+class SessionRecord:
+    id: Optional[int] = None
+    name: str = ""
+    status: str = "open"
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+    closed_at: Optional[str] = None

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import click
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 from collections import defaultdict
 
@@ -117,7 +118,8 @@ def main():
 
 @main.command("import-enroll")
 @click.argument("csv_file")
-def import_enroll(csv_file: str):
+@click.option("--dry-run", is_flag=True, default=False, help="只校验不落库，预览导入结果")
+def import_enroll(csv_file: str, dry_run: bool):
     """导入报名 CSV 文件"""
     storage = _get_storage()
     rows, abs_path = _read_csv(csv_file)
@@ -145,6 +147,8 @@ def import_enroll(csv_file: str):
             row_errors.append(("missing_phone", f"第 {source_row} 行：手机号缺失"))
         if not session:
             row_errors.append(("missing_session", f"第 {source_row} 行：场次不能为空"))
+        if session and storage.is_session_closed(session):
+            row_errors.append(("session_closed", f"第 {source_row} 行：场次「{session}」已关闭，无法导入"))
 
         if row_errors:
             for error_type, error_msg in row_errors:
@@ -166,6 +170,18 @@ def import_enroll(csv_file: str):
             source_file=os.path.basename(abs_path),
             source_row=source_row,
         ))
+
+    if dry_run:
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(valid_records)} 条报名记录")
+        skipped = len(errors)
+        if skipped:
+            click.echo(f"[DRY-RUN] 跳过 {skipped} 条问题记录：")
+            for e in errors:
+                click.echo(f"  [ERR] {e.error_message}")
+        else:
+            click.echo("[DRY-RUN] 所有记录校验通过，无错误")
+        storage.close()
+        return
 
     if valid_records:
         new_ids, existing_ids = storage.add_enrollments(valid_records)
@@ -189,7 +205,8 @@ def import_enroll(csv_file: str):
 
 @main.command("import-signin")
 @click.argument("csv_file")
-def import_signin(csv_file: str):
+@click.option("--dry-run", is_flag=True, default=False, help="只校验不落库，预览导入结果")
+def import_signin(csv_file: str, dry_run: bool):
     """导入扫码签到 CSV 文件"""
     storage = _get_storage()
     rows, abs_path = _read_csv(csv_file)
@@ -219,6 +236,8 @@ def import_signin(csv_file: str):
             row_errors.append(("missing_phone", f"第 {source_row} 行：手机号缺失"))
         if existing_sessions and session and session not in existing_sessions:
             row_errors.append(("invalid_session", f"第 {source_row} 行：场次「{session}」不存在"))
+        if session and storage.is_session_closed(session):
+            row_errors.append(("session_closed", f"第 {source_row} 行：场次「{session}」已关闭，无法导入"))
 
         if row_errors:
             for error_type, error_msg in row_errors:
@@ -242,6 +261,18 @@ def import_signin(csv_file: str):
             source_row=source_row,
         ))
 
+    if dry_run:
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(valid_records)} 条签到记录")
+        skipped = len(errors)
+        if skipped:
+            click.echo(f"[DRY-RUN] 跳过 {skipped} 条问题记录：")
+            for e in errors:
+                click.echo(f"  [ERR] {e.error_message}")
+        else:
+            click.echo("[DRY-RUN] 所有记录校验通过，无错误")
+        storage.close()
+        return
+
     if valid_records:
         new_ids, existing_ids = storage.add_signins(valid_records)
         if new_ids:
@@ -264,7 +295,8 @@ def import_signin(csv_file: str):
 
 @main.command("import-rules")
 @click.argument("json_file")
-def import_rules(json_file: str):
+@click.option("--dry-run", is_flag=True, default=False, help="只校验不落库，预览导入结果")
+def import_rules(json_file: str, dry_run: bool):
     """导入匹配规则 JSON 文件"""
     storage = _get_storage()
     abs_path = os.path.abspath(json_file)
@@ -275,25 +307,68 @@ def import_rules(json_file: str):
     with open(abs_path, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
 
+    match_rules_data = data.get("match_rules", [])
+    rules: List[MatchRule] = []
+    errors: List[str] = []
+
+    for idx, r in enumerate(match_rules_data):
+        rule_idx = idx + 1
+        if "field" not in r:
+            errors.append(f"第 {rule_idx} 条规则：缺少 field 字段")
+            continue
+        field_name = r["field"]
+        match_type = r.get("match_type", "exact")
+        if match_type not in ("exact", "fuzzy"):
+            errors.append(f"第 {rule_idx} 条规则：match_type「{match_type}」不合法，可选 exact/fuzzy")
+            continue
+        threshold = r.get("threshold")
+        if match_type == "fuzzy" and threshold is None:
+            errors.append(f"第 {rule_idx} 条规则：fuzzy 匹配必须指定 threshold")
+            continue
+        rules.append(MatchRule(
+            field_name=field_name,
+            match_type=match_type,
+            threshold=threshold,
+            priority=r.get("priority", 0),
+        ))
+
+    field_mapping_data = data.get("field_mapping", None)
+    if field_mapping_data:
+        if not isinstance(field_mapping_data, dict):
+            errors.append("field_mapping 必须是对象")
+        else:
+            for key in ("enroll", "signin"):
+                if key in field_mapping_data and not isinstance(field_mapping_data[key], dict):
+                    errors.append(f"field_mapping.{key} 必须是对象")
+
+    if dry_run:
+        click.echo(f"[DRY-RUN] 校验完成，将导入 {len(rules)} 条匹配规则")
+        if field_mapping_data:
+            click.echo("[DRY-RUN] 将更新字段映射配置")
+        if errors:
+            click.echo(f"[DRY-RUN] 发现 {len(errors)} 个错误：")
+            for e in errors:
+                click.echo(f"  [ERR] {e}")
+        else:
+            click.echo("[DRY-RUN] 所有规则校验通过，无错误")
+        storage.close()
+        return
+
+    if errors:
+        click.echo(f"错误：校验未通过，共 {len(errors)} 个问题：", err=True)
+        for e in errors:
+            click.echo(f"  [ERR] {e}", err=True)
+        storage.close()
+        sys.exit(1)
+
     prev_rules = storage.get_all_rules()
     prev_mapping = storage.get_field_mapping()
 
     storage.clear_rules()
 
-    match_rules_data = data.get("match_rules", [])
-    rules: List[MatchRule] = []
-    for r in match_rules_data:
-        rules.append(MatchRule(
-            field_name=r["field"],
-            match_type=r.get("match_type", "exact"),
-            threshold=r.get("threshold"),
-            priority=r.get("priority", 0),
-        ))
-
     if rules:
         storage.add_rules(rules)
 
-    field_mapping_data = data.get("field_mapping", None)
     if field_mapping_data:
         fm = FieldMapping(
             enroll=field_mapping_data.get("enroll", {}),
@@ -331,7 +406,10 @@ def do_reconcile():
         storage.close()
         sys.exit(1)
 
-    results = reconcile(storage)
+    results, skipped_sessions = reconcile(storage)
+
+    if skipped_sessions:
+        click.echo(f"[提示] 已跳过 {len(skipped_sessions)} 个已关闭场次：{', '.join(skipped_sessions)}")
 
     status_counts = {}
     for r in results:
@@ -612,6 +690,358 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
     storage.close()
 
 
+def _escape_html(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _build_html_report(
+    title: str,
+    global_stats: Dict[str, int],
+    session_stats: List[Dict[str, Any]],
+    results_by_session: Dict[str, List[Any]],
+    generated_at: str,
+) -> str:
+    status_colors = {
+        "normal": "#28a745",
+        "absent": "#dc3545",
+        "non_enrolled": "#ffc107",
+        "duplicate": "#6c757d",
+    }
+
+    total = sum(global_stats.values())
+    sessions_total = len(session_stats)
+
+    def _pct(cnt: int) -> str:
+        if total == 0:
+            return "0.00%"
+        return f"{cnt / total * 100:.2f}%"
+
+    global_summary_rows = ""
+    for status in ["normal", "absent", "non_enrolled", "duplicate"]:
+        cnt = global_stats.get(status, 0)
+        label = STATUS_LABELS.get(status, status)
+        color = status_colors.get(status, "#333")
+        global_summary_rows += f"""
+        <tr>
+            <td><span class="status-dot" style="background:{color}"></span>{_escape_html(label)}</td>
+            <td class="num">{cnt}</td>
+            <td class="num">{_pct(cnt)}</td>
+        </tr>"""
+
+    session_summary_rows = ""
+    for s in session_stats:
+        session_name = s["session"]
+        s_total = s["total"]
+        s_pct = f"{s_total / total * 100:.2f}%" if total > 0 else "0.00%"
+        cells = ""
+        for status in ["normal", "absent", "non_enrolled", "duplicate"]:
+            cnt = s.get(status, 0)
+            color = status_colors.get(status, "#333")
+            pct = f"{cnt / s_total * 100:.2f}%" if s_total > 0 else "0.00%"
+            cells += f'<td class="num"><span style="color:{color};font-weight:bold">{cnt}</span><br><span class="muted">{pct}</span></td>'
+        session_summary_rows += f"""
+        <tr>
+            <td><strong>{_escape_html(session_name)}</strong></td>
+            <td class="num">{s_total}</td>
+            <td class="num muted">{s_pct}</td>
+            {cells}
+        </tr>"""
+
+    detail_sections = ""
+    for session_name, results in results_by_session.items():
+        rows_html = ""
+        for r in results:
+            label = STATUS_LABELS.get(r.status, r.status)
+            color = status_colors.get(r.status, "#333")
+            rows_html += f"""
+            <tr>
+                <td class="num">{r.id}</td>
+                <td>{_escape_html(r.name)}</td>
+                <td>{_escape_html(r.phone)}</td>
+                <td><span class="status-badge" style="background:{color}">{_escape_html(label)}</span></td>
+                <td>{_escape_html(r.manual_mark) or "-"}</td>
+                <td>{_escape_html(r.notes) or "-"}</td>
+            </tr>"""
+        detail_sections += f"""
+        <section class="detail-section">
+            <h2>场次详情：{_escape_html(session_name)} <span class="muted">（{len(results)} 人）</span></h2>
+            <table class="detail-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>姓名</th>
+                        <th>手机号</th>
+                        <th>状态</th>
+                        <th>人工标记</th>
+                        <th>备注</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </section>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{_escape_html(title)}</title>
+<style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        background: #f5f7fa;
+        color: #303133;
+        line-height: 1.6;
+        padding: 24px;
+    }}
+    .container {{ max-width: 1200px; margin: 0 auto; }}
+    header {{
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+        padding: 32px;
+        border-radius: 12px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 20px rgba(102, 126, 234, 0.3);
+    }}
+    header h1 {{ font-size: 28px; margin-bottom: 8px; }}
+    header .subtitle {{ opacity: 0.9; font-size: 14px; }}
+    .card {{
+        background: #fff;
+        border-radius: 10px;
+        padding: 24px;
+        margin-bottom: 20px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+    }}
+    .card h2 {{
+        font-size: 18px;
+        margin-bottom: 16px;
+        color: #303133;
+        border-left: 4px solid #667eea;
+        padding-left: 12px;
+    }}
+    .stats-grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 16px;
+        margin-bottom: 20px;
+    }}
+    .stat-card {{
+        padding: 16px;
+        border-radius: 8px;
+        text-align: center;
+        color: #fff;
+    }}
+    .stat-card .num {{ font-size: 28px; font-weight: bold; }}
+    .stat-card .label {{ font-size: 13px; opacity: 0.9; margin-top: 4px; }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }}
+    th, td {{
+        padding: 12px 16px;
+        text-align: left;
+        border-bottom: 1px solid #ebeef5;
+    }}
+    th {{
+        background: #fafafa;
+        font-weight: 600;
+        color: #606266;
+    }}
+    tr:hover td {{ background: #fafbfc; }}
+    td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    th.num {{ text-align: right; }}
+    .status-dot {{
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: middle;
+    }}
+    .status-badge {{
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 12px;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 500;
+    }}
+    .muted {{ color: #909399; font-size: 12px; }}
+    .detail-section {{ margin-bottom: 32px; }}
+    .detail-section h2 {{
+        font-size: 16px;
+        margin-bottom: 12px;
+    }}
+    footer {{
+        text-align: center;
+        color: #909399;
+        font-size: 13px;
+        padding: 24px;
+    }}
+</style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>{_escape_html(title)}</h1>
+        <div class="subtitle">生成时间：{_escape_html(generated_at)}　·　共 {sessions_total} 场次　·　{total} 条记录</div>
+    </header>
+
+    <div class="card">
+        <h2>全局汇总</h2>
+        <div class="stats-grid">
+            <div class="stat-card" style="background: linear-gradient(135deg, #28a745, #20c997)">
+                <div class="num">{global_stats.get("normal", 0)}</div>
+                <div class="label">正常签到</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #dc3545, #e74c3c)">
+                <div class="num">{global_stats.get("absent", 0)}</div>
+                <div class="label">缺席</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #ffc107, #fd7e14)">
+                <div class="num">{global_stats.get("non_enrolled", 0)}</div>
+                <div class="label">非报名人员</div>
+            </div>
+            <div class="stat-card" style="background: linear-gradient(135deg, #6c757d, #495057)">
+                <div class="num">{global_stats.get("duplicate", 0)}</div>
+                <div class="label">重复扫码</div>
+            </div>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>状态</th>
+                    <th class="num">人数</th>
+                    <th class="num">占比</th>
+                </tr>
+            </thead>
+            <tbody>{global_summary_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>按场次统计</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>场次</th>
+                    <th class="num">总计</th>
+                    <th class="num">占比</th>
+                    <th class="num">正常签到</th>
+                    <th class="num">缺席</th>
+                    <th class="num">非报名人员</th>
+                    <th class="num">重复扫码</th>
+                </tr>
+            </thead>
+            <tbody>{session_summary_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        {detail_sections}
+    </div>
+
+    <footer>
+        由 signcheck 签到对账工具生成
+    </footer>
+</div>
+</body>
+</html>"""
+
+
+@main.command("report")
+@click.option("--output", "-o", default="signin_report.html", help="输出文件路径（默认 signin_report.html）")
+@click.option("--session", default=None, help="按指定场次生成报告，不指定则生成全局报告")
+@click.option("--format", "fmt", type=click.Choice(["html"]), default="html", help="报告格式（目前支持 html）")
+def do_report(output: str, session: Optional[str], fmt: str):
+    """生成签到报告（HTML 格式，含汇总统计与详细名单）"""
+    storage = _get_storage()
+
+    all_results = storage.get_all_reconcile_results()
+    if not all_results:
+        click.echo("错误：暂无对账结果，请先执行 reconcile", err=True)
+        storage.close()
+        sys.exit(1)
+
+    all_sessions = storage.get_reconcile_sessions()
+
+    if session is not None:
+        if session not in all_sessions:
+            click.echo(f"错误：场次「{session}」不存在，可用场次：{', '.join(all_sessions)}", err=True)
+            storage.close()
+            sys.exit(1)
+        results = [r for r in all_results if r.session == session]
+        target_sessions = [session]
+        title = f"签到报告 - {session}"
+    else:
+        results = all_results
+        target_sessions = all_sessions
+        title = "签到报告 - 全局汇总"
+
+    global_stats: Dict[str, int] = defaultdict(int)
+    for r in results:
+        global_stats[r.status] += 1
+
+    session_status_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in results:
+        session_status_counts[r.session][r.status] += 1
+
+    session_stats: List[Dict[str, Any]] = []
+    for s in target_sessions:
+        counts = session_status_counts.get(s, {})
+        s_total = sum(counts.values())
+        row = {"session": s, "total": s_total}
+        for st in ["normal", "absent", "non_enrolled", "duplicate"]:
+            row[st] = counts.get(st, 0)
+        session_stats.append(row)
+
+    results_by_session: Dict[str, List[Any]] = {}
+    for s in target_sessions:
+        results_by_session[s] = sorted(
+            [r for r in results if r.session == s],
+            key=lambda r: (r.status, r.name or "")
+        )
+
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if fmt == "html":
+        html = _build_html_report(
+            title=title,
+            global_stats=dict(global_stats),
+            session_stats=session_stats,
+            results_by_session=results_by_session,
+            generated_at=generated_at,
+        )
+        abs_output = os.path.abspath(output)
+        with open(abs_output, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    click.echo(f"[OK] 报告已生成：{abs_output}")
+    click.echo(f"  场次：{len(target_sessions)} 个　记录：{len(results)} 条")
+    for st in ["normal", "absent", "non_enrolled", "duplicate"]:
+        cnt = global_stats.get(st, 0)
+        label = STATUS_LABELS.get(st, st)
+        click.echo(f"  {label}: {cnt}")
+    click.echo(f"  浏览器打开即可查看")
+
+    storage.close()
+
+
 @main.command("status")
 def do_status():
     """查看当前状态"""
@@ -817,6 +1247,90 @@ def do_stats(session: Optional[str], export: Optional[str]):
                 ])
         click.echo(f"[OK] 已导出 {len(stats_rows)} 场统计到 {abs_output}")
 
+    storage.close()
+
+
+@main.group("session")
+def session_group():
+    """管理场次生命周期"""
+    pass
+
+
+@session_group.command("create")
+@click.argument("name")
+@click.option("--start", "start_time", default=None, help="场次开始时间")
+@click.option("--end", "end_time", default=None, help="场次结束时间")
+@click.option("--desc", "description", default=None, help="场次描述")
+def session_create(name: str, start_time: Optional[str], end_time: Optional[str], description: Optional[str]):
+    """创建新场次"""
+    storage = _get_storage()
+    session_id = storage.create_session(name, start_time, end_time, description)
+    if session_id is None:
+        click.echo(f"错误：场次「{name}」已存在", err=True)
+        storage.close()
+        sys.exit(1)
+    click.echo(f"[OK] 已创建场次「{name}」（ID: {session_id}）")
+    storage.close()
+
+
+@session_group.command("close")
+@click.argument("name")
+def session_close(name: str):
+    """关闭场次，拒绝新导入和对账操作"""
+    storage = _get_storage()
+    if storage.get_session(name) is None:
+        click.echo(f"错误：场次「{name}」不存在", err=True)
+        storage.close()
+        sys.exit(1)
+    ok = storage.close_session(name)
+    if not ok:
+        click.echo(f"错误：场次「{name}」已处于关闭状态", err=True)
+        storage.close()
+        sys.exit(1)
+    click.echo(f"[OK] 场次「{name}」已关闭")
+    storage.close()
+
+
+@session_group.command("list")
+def session_list():
+    """列出所有场次及状态"""
+    storage = _get_storage()
+    sessions = storage.get_all_sessions()
+    if not sessions:
+        click.echo("暂无场次，请使用 session create 创建")
+        storage.close()
+        return
+
+    col_widths = {
+        "name": max(6, max(len(s.name) for s in sessions)),
+        "status": max(8, max(len("已关闭" if s.status == "closed" else "进行中") for s in sessions)),
+        "start": max(8, max(len(s.start_time or "-") for s in sessions)),
+        "end": max(8, max(len(s.end_time or "-") for s in sessions)),
+        "created": max(8, max(len(s.created_at or "-") for s in sessions)),
+    }
+
+    header = (
+        f"{'场次名':<{col_widths['name']}}  "
+        f"{'状态':<{col_widths['status']}}  "
+        f"{'开始时间':<{col_widths['start']}}  "
+        f"{'结束时间':<{col_widths['end']}}  "
+        f"{'创建时间':<{col_widths['created']}}"
+    )
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for s in sessions:
+        status_label = "已关闭" if s.status == "closed" else "进行中"
+        row = (
+            f"{s.name:<{col_widths['name']}}  "
+            f"{status_label:<{col_widths['status']}}  "
+            f"{s.start_time or '-':<{col_widths['start']}}  "
+            f"{s.end_time or '-':<{col_widths['end']}}  "
+            f"{s.created_at or '-':<{col_widths['created']}}"
+        )
+        click.echo(row)
+
+    click.echo(f"\n共 {len(sessions)} 个场次")
     storage.close()
 
 
