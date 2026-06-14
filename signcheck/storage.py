@@ -653,3 +653,60 @@ class Storage:
             "error_count": error_cnt,
             "status_counts": status_counts,
         }
+
+    # ── Backup / Restore ───────────────────────────────────────
+
+    BACKUP_TABLES = [
+        "enrollments",
+        "signins",
+        "rules",
+        "field_mapping",
+        "reconcile_results",
+        "undo_history",
+        "import_errors",
+        "saved_views",
+        "sessions",
+    ]
+
+    def export_all(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        for table in self.BACKUP_TABLES:
+            rows = self.conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            snapshot[table] = [dict(r) for r in rows]
+        snapshot["_meta"] = {
+            "version": "1.0",
+            "exported_at": self._now(),
+            "tables": self.BACKUP_TABLES,
+        }
+        return snapshot
+
+    def _table_row_count(self, table: str) -> int:
+        cur = self.conn.execute(f"SELECT COUNT(*) as c FROM {table}")
+        return cur.fetchone()["c"]
+
+    def get_conflict_summary(self) -> Dict[str, Any]:
+        conflicts: Dict[str, Any] = {}
+        conflicts["sessions"] = [s.name for s in self.get_all_sessions()]
+        conflicts["table_counts"] = {t: self._table_row_count(t) for t in self.BACKUP_TABLES}
+        return conflicts
+
+    def import_snapshot(self, snapshot: Dict[str, Any], overwrite: bool = False):
+        for table in self.BACKUP_TABLES:
+            rows = snapshot.get(table, [])
+            if not rows:
+                continue
+            if overwrite:
+                self.conn.execute(f"DELETE FROM {table}")
+            columns = list(rows[0].keys())
+            cols_sql = ",".join(columns)
+            placeholders = ",".join("?" * len(columns))
+            sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({placeholders})"
+            batch = []
+            for row in rows:
+                batch.append([row.get(c) for c in columns])
+                if len(batch) >= 500:
+                    self.conn.executemany(sql, batch)
+                    batch = []
+            if batch:
+                self.conn.executemany(sql, batch)
+        self.conn.commit()

@@ -2,10 +2,21 @@ import csv
 import json
 import os
 import sys
+import zipfile
+import tempfile
+import shutil
 import click
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from collections import defaultdict
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 from .models import (
     EnrollmentRecord,
@@ -27,6 +38,49 @@ STATUS_LABELS = {
     "non_enrolled": "非报名人员",
     "duplicate": "重复扫码",
 }
+
+
+def _write_json(file_path: str, data: Any):
+    abs_path = os.path.abspath(file_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _write_xlsx(file_path: str, headers: List[str], rows: List[List[Any]], sheet_name: str = "Sheet1"):
+    if not HAS_OPENPYXL:
+        raise RuntimeError("openpyxl 未安装，请执行：pip install openpyxl>=3.1.0")
+    abs_path = os.path.abspath(file_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    bold_font = Font(bold=True)
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = bold_font
+        cell.alignment = center_align
+
+    for row_idx, row_data in enumerate(rows, start=2):
+        for col_idx, value in enumerate(row_data, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    ws.freeze_panes = "A2"
+
+    for col_idx in range(1, len(headers) + 1):
+        max_len = len(str(headers[col_idx - 1]))
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2, max_row=ws.max_row):
+            for cell in row:
+                if cell.value is not None:
+                    cell_len = len(str(cell.value))
+                    if cell_len > max_len:
+                        max_len = cell_len
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 50)
+
+    wb.save(abs_path)
 
 
 def _resolve_filters(
@@ -630,8 +684,9 @@ def do_batch_mark(csv_file: str):
 @click.option("--sort-by", type=click.Choice(["id", "status"]), default=None, help="排序字段")
 @click.option("--sort-order", type=click.Choice(["asc", "desc"]), default=None, help="排序方向")
 @click.option("--view", "-v", default=None, help="使用已保存的视图名加载筛选条件")
-def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order, view):
-    """导出对账结果为 CSV（支持筛选）"""
+@click.option("--format", "fmt", type=click.Choice(["csv", "json", "xlsx"]), default="csv", help="导出格式：csv/json/xlsx")
+def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order, view, fmt):
+    """导出对账结果（支持 CSV/JSON/XLSX 格式，可筛选）"""
     storage = _get_storage()
     if status is not None:
         status = _validate_status(status)
@@ -658,15 +713,70 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
         sys.exit(1)
 
     if output is None:
-        output = config_module.get_config("export_path")
+        default_ext = {"csv": ".csv", "json": ".json", "xlsx": ".xlsx"}[fmt]
+        base_output = config_module.get_config("export_path")
+        base, ext = os.path.splitext(base_output)
+        output = base + default_ext
 
     abs_output = os.path.abspath(output)
-    with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"])
+
+    status_counts = {}
+    for r in results:
+        status_counts[r.status] = status_counts.get(r.status, 0) + 1
+
+    if fmt == "csv":
+        os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+        with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"])
+            for r in results:
+                label = STATUS_LABELS.get(r.status, r.status)
+                writer.writerow([
+                    r.id,
+                    r.name,
+                    r.phone or "",
+                    r.session,
+                    label,
+                    r.manual_mark or "",
+                    r.notes or "",
+                ])
+    elif fmt == "json":
+        records = []
+        for r in results:
+            records.append({
+                "id": r.id,
+                "name": r.name,
+                "phone": r.phone,
+                "session": r.session,
+                "status": {
+                    "code": r.status,
+                    "label": STATUS_LABELS.get(r.status, r.status),
+                },
+                "manual_mark": r.manual_mark,
+                "notes": r.notes,
+                "references": {
+                    "enroll_id": r.enroll_id,
+                    "signin_id": r.signin_id,
+                },
+                "created_at": r.created_at,
+            })
+        json_data = {
+            "meta": {
+                "generated_at": datetime.now().isoformat(),
+                "total": len(results),
+                "status_summary": {
+                    STATUS_LABELS.get(s, s): c for s, c in status_counts.items()
+                },
+            },
+            "records": records,
+        }
+        _write_json(abs_output, json_data)
+    elif fmt == "xlsx":
+        headers = ["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"]
+        rows = []
         for r in results:
             label = STATUS_LABELS.get(r.status, r.status)
-            writer.writerow([
+            rows.append([
                 r.id,
                 r.name,
                 r.phone or "",
@@ -675,12 +785,9 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
                 r.manual_mark or "",
                 r.notes or "",
             ])
+        _write_xlsx(abs_output, headers, rows, sheet_name="对账结果")
 
-    status_counts = {}
-    for r in results:
-        status_counts[r.status] = status_counts.get(r.status, 0) + 1
-
-    click.echo(f"[OK] 已导出 {len(results)} 条对账结果到 {abs_output}")
+    click.echo(f"[OK] 已导出 {len(results)} 条对账结果到 {abs_output}（格式：{fmt}）")
     click.echo("汇总：")
     for st in ["normal", "absent", "non_enrolled", "duplicate"]:
         cnt = status_counts.get(st, 0)
@@ -1028,6 +1135,7 @@ def do_report(output: str, session: Optional[str], fmt: str):
             generated_at=generated_at,
         )
         abs_output = os.path.abspath(output)
+        os.makedirs(os.path.dirname(abs_output), exist_ok=True)
         with open(abs_output, "w", encoding="utf-8") as f:
             f.write(html)
 
@@ -1110,6 +1218,145 @@ def do_reset():
         click.echo("当前无数据")
 
 
+@main.command("backup")
+@click.option("--output-dir", "-d", default=".", help="备份文件输出目录（默认当前目录）")
+def do_backup(output_dir: str):
+    """备份全部数据为时间戳命名的 .zip 快照"""
+    storage = _get_storage()
+    snapshot = storage.export_all()
+    storage.close()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"signcheck_backup_{timestamp}.zip"
+    abs_output_dir = os.path.abspath(output_dir)
+    os.makedirs(abs_output_dir, exist_ok=True)
+    abs_output = os.path.join(abs_output_dir, backup_name)
+
+    tmp_dir = tempfile.mkdtemp(prefix="signcheck_backup_")
+    try:
+        meta_file = os.path.join(tmp_dir, "metadata.json")
+        meta = snapshot.get("_meta", {})
+        meta["filename"] = backup_name
+        _write_json(meta_file, meta)
+
+        for table_name in Storage.BACKUP_TABLES:
+            rows = snapshot.get(table_name, [])
+            if rows:
+                table_file = os.path.join(tmp_dir, f"{table_name}.json")
+                _write_json(table_file, rows)
+
+        with zipfile.ZipFile(abs_output, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(meta_file, "metadata.json")
+            for table_name in Storage.BACKUP_TABLES:
+                table_file = os.path.join(tmp_dir, f"{table_name}.json")
+                if os.path.exists(table_file):
+                    zf.write(table_file, f"{table_name}.json")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    click.echo(f"[OK] 备份已生成：{abs_output}")
+    summary = snapshot.get("_meta", {})
+    for table in Storage.BACKUP_TABLES:
+        cnt = len(snapshot.get(table, []))
+        if cnt > 0:
+            click.echo(f"  {table}: {cnt} 条")
+    click.echo(f"  导出时间：{summary.get('exported_at', 'N/A')}")
+
+
+@main.command("restore")
+@click.argument("backup_file")
+@click.option("--force", is_flag=True, default=False, help="跳过冲突确认，强制覆盖还原")
+def do_restore(backup_file: str, force: bool):
+    """从备份 .zip 还原数据，还原前检查冲突"""
+    abs_backup = os.path.abspath(backup_file)
+    if not os.path.exists(abs_backup):
+        click.echo(f"错误：备份文件不存在 {abs_backup}", err=True)
+        sys.exit(1)
+    if not zipfile.is_zipfile(abs_backup):
+        click.echo(f"错误：{abs_backup} 不是有效的 zip 文件", err=True)
+        sys.exit(1)
+
+    tmp_dir = tempfile.mkdtemp(prefix="signcheck_restore_")
+    try:
+        with zipfile.ZipFile(abs_backup, "r") as zf:
+            zf.extractall(tmp_dir)
+
+        meta_file = os.path.join(tmp_dir, "metadata.json")
+        if not os.path.exists(meta_file):
+            click.echo("错误：备份文件缺少 metadata.json", err=True)
+            sys.exit(1)
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        snapshot: Dict[str, Any] = {"_meta": meta}
+        for table_name in Storage.BACKUP_TABLES:
+            table_file = os.path.join(tmp_dir, f"{table_name}.json")
+            if os.path.exists(table_file):
+                with open(table_file, "r", encoding="utf-8") as f:
+                    snapshot[table_name] = json.load(f)
+            else:
+                snapshot[table_name] = []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    storage = _get_storage()
+    try:
+        current = storage.get_conflict_summary()
+        backup_sessions = set()
+        for s in snapshot.get("sessions", []):
+            if s.get("name"):
+                backup_sessions.add(s["name"])
+        for e in snapshot.get("enrollments", []):
+            if e.get("session"):
+                backup_sessions.add(e["session"])
+        for s in snapshot.get("signins", []):
+            if s.get("session"):
+                backup_sessions.add(s["session"])
+        for r in snapshot.get("reconcile_results", []):
+            if r.get("session"):
+                backup_sessions.add(r["session"])
+
+        current_sessions = set(current.get("sessions", []))
+        session_conflicts = sorted(backup_sessions & current_sessions)
+
+        table_conflicts = []
+        for table in Storage.BACKUP_TABLES:
+            cur_cnt = current.get("table_counts", {}).get(table, 0)
+            bak_cnt = len(snapshot.get(table, []))
+            if cur_cnt > 0 and bak_cnt > 0:
+                table_conflicts.append((table, cur_cnt, bak_cnt))
+
+        has_conflict = bool(session_conflicts or table_conflicts)
+
+        if has_conflict and not force:
+            click.echo("检测到冲突，请确认是否继续还原：")
+            click.echo()
+            if session_conflicts:
+                click.echo(f"场次名冲突（{len(session_conflicts)} 个）：")
+                for s in session_conflicts:
+                    click.echo(f"  - {s}")
+                click.echo()
+            if table_conflicts:
+                click.echo("现有数据与备份数据重叠的表：")
+                for table, cur_cnt, bak_cnt in table_conflicts:
+                    click.echo(f"  - {table}: 当前 {cur_cnt} 条 / 备份 {bak_cnt} 条")
+                click.echo()
+            if not click.confirm("确认用备份数据覆盖当前全部数据？此操作不可撤销"):
+                click.echo("已取消还原")
+                storage.close()
+                return
+
+        storage.import_snapshot(snapshot, overwrite=True)
+
+        click.echo(f"[OK] 已从备份还原：{abs_backup}")
+        for table in Storage.BACKUP_TABLES:
+            cnt = len(snapshot.get(table, []))
+            if cnt > 0:
+                click.echo(f"  {table}: 还原 {cnt} 条")
+    finally:
+        storage.close()
+
+
 def _calc_percentage(count: int, total: int) -> str:
     if total == 0:
         return "0.00%"
@@ -1183,8 +1430,9 @@ def _print_stats_table(rows: List[Dict[str, Any]], show_global: bool = True):
 
 @main.command("stats")
 @click.option("--session", default=None, help="按指定场次查看统计")
-@click.option("--export", "-o", default=None, help="导出统计结果为 CSV")
-def do_stats(session: Optional[str], export: Optional[str]):
+@click.option("--export", "-o", default=None, help="导出统计结果到文件")
+@click.option("--format", "fmt", type=click.Choice(["csv", "json", "xlsx"]), default="csv", help="导出格式：csv/json/xlsx")
+def do_stats(session: Optional[str], export: Optional[str], fmt: str):
     """查看对账结果统计汇总"""
     storage = _get_storage()
 
@@ -1215,37 +1463,80 @@ def do_stats(session: Optional[str], export: Optional[str]):
         click.echo(f"\n共 {len(stats_rows)} 场，{total_all} 条记录")
     else:
         abs_output = os.path.abspath(export)
-        with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["场次", "总计", "正常签到", "正常签到占比", "缺席", "缺席占比", "非报名人员", "非报名人员占比", "重复扫码", "重复扫码占比"])
+        headers = ["场次", "总计", "正常签到", "正常签到占比", "缺席", "缺席占比", "非报名人员", "非报名人员占比", "重复扫码", "重复扫码占比"]
+        display_rows = []
+        for r in stats_rows:
+            display_rows.append([
+                r["session"],
+                r["total"],
+                r["normal"],
+                r["normal_pct"],
+                r["absent"],
+                r["absent_pct"],
+                r["non_enrolled"],
+                r["non_enrolled_pct"],
+                r["duplicate"],
+                r["duplicate_pct"],
+            ])
+        if session is None and len(stats_rows) > 1:
+            total_all = sum(r["total"] for r in stats_rows)
+            display_rows.append([
+                "合计",
+                total_all,
+                sum(r["normal"] for r in stats_rows),
+                _calc_percentage(sum(r["normal"] for r in stats_rows), total_all),
+                sum(r["absent"] for r in stats_rows),
+                _calc_percentage(sum(r["absent"] for r in stats_rows), total_all),
+                sum(r["non_enrolled"] for r in stats_rows),
+                _calc_percentage(sum(r["non_enrolled"] for r in stats_rows), total_all),
+                sum(r["duplicate"] for r in stats_rows),
+                _calc_percentage(sum(r["duplicate"] for r in stats_rows), total_all),
+            ])
+
+        if fmt == "csv":
+            os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+            with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for row in display_rows:
+                    writer.writerow(row)
+        elif fmt == "json":
+            session_stats = []
             for r in stats_rows:
-                writer.writerow([
-                    r["session"],
-                    r["total"],
-                    r["normal"],
-                    r["normal_pct"],
-                    r["absent"],
-                    r["absent_pct"],
-                    r["non_enrolled"],
-                    r["non_enrolled_pct"],
-                    r["duplicate"],
-                    r["duplicate_pct"],
-                ])
+                session_stats.append({
+                    "session": r["session"],
+                    "total": r["total"],
+                    "status": {
+                        STATUS_LABELS[s]: {
+                            "count": r[s],
+                            "percentage": r[f"{s}_pct"],
+                        } for s in ["normal", "absent", "non_enrolled", "duplicate"]
+                    },
+                })
+            json_data = {
+                "meta": {
+                    "generated_at": datetime.now().isoformat(),
+                    "sessions_count": len(stats_rows),
+                    "total_records": sum(r["total"] for r in stats_rows),
+                },
+                "sessions": session_stats,
+            }
             if session is None and len(stats_rows) > 1:
                 total_all = sum(r["total"] for r in stats_rows)
-                writer.writerow([
-                    "合计",
-                    total_all,
-                    sum(r["normal"] for r in stats_rows),
-                    _calc_percentage(sum(r["normal"] for r in stats_rows), total_all),
-                    sum(r["absent"] for r in stats_rows),
-                    _calc_percentage(sum(r["absent"] for r in stats_rows), total_all),
-                    sum(r["non_enrolled"] for r in stats_rows),
-                    _calc_percentage(sum(r["non_enrolled"] for r in stats_rows), total_all),
-                    sum(r["duplicate"] for r in stats_rows),
-                    _calc_percentage(sum(r["duplicate"] for r in stats_rows), total_all),
-                ])
-        click.echo(f"[OK] 已导出 {len(stats_rows)} 场统计到 {abs_output}")
+                json_data["global"] = {
+                    "total": total_all,
+                    "status": {
+                        STATUS_LABELS[s]: {
+                            "count": sum(r[s] for r in stats_rows),
+                            "percentage": _calc_percentage(sum(r[s] for r in stats_rows), total_all),
+                        } for s in ["normal", "absent", "non_enrolled", "duplicate"]
+                    },
+                }
+            _write_json(abs_output, json_data)
+        elif fmt == "xlsx":
+            _write_xlsx(abs_output, headers, display_rows, sheet_name="场次统计")
+
+        click.echo(f"[OK] 已导出 {len(stats_rows)} 场统计到 {abs_output}（格式：{fmt}）")
 
     storage.close()
 
