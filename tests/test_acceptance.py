@@ -920,6 +920,296 @@ def test_batch_mark_empty_csv():
         ctx.cleanup()
 
 
+def test_list_empty_results():
+    print("\n=== Test 21: list with no reconcile results ===")
+    ctx = TestContext()
+    try:
+        r = ctx.run(["list"])
+        assert "暂无" in r.stdout, f"Should show empty message: {r.stdout}"
+        assert r.returncode == 0
+
+        print("  [PASS] list empty results")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_with_filters():
+    print("\n=== Test 22: list with status/session/keyword filters ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        r = ctx.run(["list", "--status", "absent"])
+        assert "缺席" in r.stdout, f"Should show absent results: {r.stdout}"
+        assert "正常签到" not in r.stdout, f"Should not show normal results: {r.stdout}"
+
+        r = ctx.run(["list", "--status", "normal"])
+        assert "正常签到" in r.stdout, f"Should show normal results: {r.stdout}"
+
+        r = ctx.run(["list", "--keyword", "张"])
+        assert "张" in r.stdout, f"Should show results with keyword: {r.stdout}"
+
+        r = ctx.run(["list", "--keyword", "13800001111"])
+        assert "13800001111" in r.stdout, f"Should show results with phone keyword: {r.stdout}"
+
+        r = ctx.run(["list", "--limit", "2"])
+        lines = [l for l in r.stdout.strip().split("\n") if l and not l.startswith("-") and not l.startswith("共")]
+        data_lines = [l for l in lines if not l.startswith("ID")]
+        assert len(data_lines) <= 2, f"Should limit to 2 results: {len(data_lines)}"
+
+        r = ctx.run(["list", "--sort-by", "status", "--sort-order", "desc"])
+        assert r.returncode == 0
+
+        print("  [PASS] list with filters")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_invalid_status():
+    print("\n=== Test 23: list with invalid status ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        r = ctx.run(["list", "--status", "invalid_status"], expect_fail=True)
+        assert r.returncode != 0, "Should fail on invalid status"
+        assert "非法状态" in r.stderr, f"Should mention invalid status: {r.stderr}"
+
+        print("  [PASS] list invalid status")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_view_not_found():
+    print("\n=== Test 24: list with non-existent view ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        r = ctx.run(["list", "--view", "nonexistent"], expect_fail=True)
+        assert r.returncode != 0, "Should fail on non-existent view"
+        assert "不存在" in r.stderr, f"Should mention view not found: {r.stderr}"
+
+        print("  [PASS] list view not found")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_save_view_conflict():
+    print("\n=== Test 25: list save-view with name conflict ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--save-view", "abs_only"])
+
+        r = ctx.run(["list", "--status", "normal", "--save-view", "abs_only"], expect_fail=True)
+        assert r.returncode != 0, "Should fail on duplicate view name"
+        assert "已存在" in r.stderr, f"Should mention name conflict: {r.stderr}"
+
+        views = ctx.db_execute("SELECT * FROM saved_views WHERE name='abs_only'")
+        saved_filters = json.loads(views[0]["filters"])
+        assert saved_filters["status"] == "absent", "Original view should not be overwritten"
+
+        print("  [PASS] list save-view name conflict")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_save_view_overwrite():
+    print("\n=== Test 26: list save-view with overwrite ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--save-view", "myview"])
+
+        r = ctx.run(["list", "--status", "normal", "--save-view", "myview", "--overwrite"])
+        assert r.returncode == 0, f"Should succeed with overwrite: {r.stderr}"
+        assert "已保存" in r.stdout, f"Should confirm save: {r.stdout}"
+
+        views = ctx.db_execute("SELECT * FROM saved_views WHERE name='myview'")
+        saved_filters = json.loads(views[0]["filters"])
+        assert saved_filters["status"] == "normal", f"View should be updated: {saved_filters}"
+
+        print("  [PASS] list save-view overwrite")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_use_view_after_restart():
+    print("\n=== Test 27: use saved view after process restart ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--save-view", "abs_view"])
+
+        r = ctx.run(["list", "--view", "abs_view"])
+        assert "缺席" in r.stdout, f"Should show absent results via view: {r.stdout}"
+        assert "正常签到" not in r.stdout, f"Should not show normal results: {r.stdout}"
+
+        r2 = ctx.run(["list", "--view", "abs_view"])
+        assert r2.stdout == r.stdout, "Result should be stable across restarts"
+
+        print("  [PASS] use saved view after restart")
+    finally:
+        ctx.cleanup()
+
+
+def test_view_list_and_delete():
+    print("\n=== Test 28: view-list and view-delete commands ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        r = ctx.run(["view-list"])
+        assert "暂无" in r.stdout, f"Should show no views: {r.stdout}"
+
+        ctx.run(["list", "--status", "absent", "--save-view", "v1"])
+        ctx.run(["list", "--status", "normal", "--session", "上午场", "--save-view", "v2"])
+
+        r = ctx.run(["view-list"])
+        assert "v1" in r.stdout, f"Should list v1: {r.stdout}"
+        assert "v2" in r.stdout, f"Should list v2: {r.stdout}"
+        assert "共 2" in r.stdout, f"Should show 2 views: {r.stdout}"
+
+        r = ctx.run(["view-delete", "v1"])
+        assert "已删除" in r.stdout, f"Should confirm delete: {r.stdout}"
+
+        r = ctx.run(["view-list"])
+        assert "v1" not in r.stdout, f"v1 should be deleted: {r.stdout}"
+        assert "v2" in r.stdout, f"v2 should still exist: {r.stdout}"
+
+        r = ctx.run(["view-delete", "nonexistent"], expect_fail=True)
+        assert r.returncode != 0, "Should fail on non-existent view delete"
+        assert "不存在" in r.stderr, f"Should mention not found: {r.stderr}"
+
+        print("  [PASS] view-list and view-delete")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_filter_with_mark():
+    print("\n=== Test 29: list filter by manual mark ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["mark", "1", "--mark-text", "confirmed", "--notes", "verified"])
+
+        r = ctx.run(["list", "--mark", "confirmed"])
+        assert "confirmed" in r.stdout, f"Should show marked results: {r.stdout}"
+
+        r = ctx.run(["list", "--mark", "nonexistent_mark"])
+        assert "暂无" in r.stdout, f"Should show empty for non-existent mark: {r.stdout}"
+
+        print("  [PASS] list filter by manual mark")
+    finally:
+        ctx.cleanup()
+
+
+def test_export_with_filters():
+    print("\n=== Test 30: export with filter options ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["mark", "1", "--mark-text", "confirmed", "--notes", "phone ok"])
+
+        output_path = os.path.join(ctx.tmpdir, "filtered.csv")
+        r = ctx.run(["export", "--status", "absent", "--output", output_path])
+        rows = read_export_csv(output_path)
+
+        status_key = "\ufeff状态" if "\ufeff状态" in rows[0] else "状态"
+        for row in rows:
+            assert row[status_key] == "缺席", f"All exported rows should be absent: {row[status_key]}"
+
+        mark_key = "\ufeff标记" if "\ufeff标记" in rows[0] else "标记"
+        notes_key = "\ufeff备注" if "\ufeff备注" in rows[0] else "备注"
+        id_key = "\ufeffID" if "\ufeffID" in rows[0] else "ID"
+        assert "标记" in rows[0], f"Export should have 标记 column"
+        assert "备注" in rows[0] or "\ufeff备注" in rows[0], f"Export should have 备注 column"
+
+        output2 = os.path.join(ctx.tmpdir, "all.csv")
+        r = ctx.run(["export", "--output", output2])
+        all_rows = read_export_csv(output2)
+        assert len(all_rows) > len(rows), f"Unfiltered export should have more rows: {len(all_rows)} vs {len(rows)}"
+
+        print("  [PASS] export with filters")
+    finally:
+        ctx.cleanup()
+
+
+def test_export_from_view():
+    print("\n=== Test 31: export using saved view ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--save-view", "abs_export"])
+
+        output_path = os.path.join(ctx.tmpdir, "view_export.csv")
+        r = ctx.run(["export", "--view", "abs_export", "--output", output_path])
+        rows = read_export_csv(output_path)
+
+        status_key = "\ufeff状态" if "\ufeff状态" in rows[0] else "状态"
+        for row in rows:
+            assert row[status_key] == "缺席", f"All rows should be absent via view: {row[status_key]}"
+
+        print("  [PASS] export from saved view")
+    finally:
+        ctx.cleanup()
+
+
+def test_view_persistence_across_restart():
+    print("\n=== Test 32: saved views persist across DB restart ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--keyword", "孙", "--save-view", "persist_test"])
+
+        views1 = ctx.db_execute("SELECT * FROM saved_views WHERE name='persist_test'")
+        assert len(views1) == 1, "View should be in DB"
+        saved_filters1 = json.loads(views1[0]["filters"])
+        assert saved_filters1["status"] == "absent"
+        assert saved_filters1["keyword"] == "孙"
+
+        r = ctx.run(["list", "--view", "persist_test"])
+        assert "缺席" in r.stdout, f"View should work after restart: {r.stdout}"
+
+        views2 = ctx.db_execute("SELECT * FROM saved_views WHERE name='persist_test'")
+        saved_filters2 = json.loads(views2[0]["filters"])
+        assert saved_filters2 == saved_filters1, "Filters should be identical after restart"
+
+        output_path = os.path.join(ctx.tmpdir, "persist_export.csv")
+        ctx.run(["export", "--view", "persist_test", "--output", output_path])
+        rows = read_export_csv(output_path)
+        assert len(rows) > 0, "Export from persisted view should have rows"
+
+        print("  [PASS] view persistence across restart")
+    finally:
+        ctx.cleanup()
+
+
+def test_list_combined_filters():
+    print("\n=== Test 33: list with combined filters and view override ===")
+    ctx = TestContext()
+    try:
+        _setup_reconciled_data(ctx)
+
+        ctx.run(["list", "--status", "absent", "--save-view", "base_abs"])
+
+        r = ctx.run(["list", "--view", "base_abs", "--status", "normal"])
+        assert "正常签到" in r.stdout, f"CLI option should override view status: {r.stdout}"
+        assert "缺席" not in r.stdout, f"Should not show absent when overridden: {r.stdout}"
+
+        print("  [PASS] list combined filters with view override")
+    finally:
+        ctx.cleanup()
+
+
 if __name__ == "__main__":
     os.chdir(os.path.dirname(__file__) + "/..")
     print("Running acceptance tests...")
@@ -943,4 +1233,17 @@ if __name__ == "__main__":
     test_batch_mark_persistence_across_sessions()
     test_batch_mark_no_notes_column()
     test_batch_mark_empty_csv()
+    test_list_empty_results()
+    test_list_with_filters()
+    test_list_invalid_status()
+    test_list_view_not_found()
+    test_list_save_view_conflict()
+    test_list_save_view_overwrite()
+    test_list_use_view_after_restart()
+    test_view_list_and_delete()
+    test_list_filter_with_mark()
+    test_export_with_filters()
+    test_export_from_view()
+    test_view_persistence_across_restart()
+    test_list_combined_filters()
     print("\n[OK] All acceptance tests passed!")

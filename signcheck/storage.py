@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS import_errors (
     error_message TEXT NOT NULL,
     raw_data TEXT
 );
+
+CREATE TABLE IF NOT EXISTS saved_views (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    filters TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -426,6 +434,76 @@ class Storage:
     def count_reconcile_results_by_status(self) -> Dict[str, int]:
         rows = self.conn.execute("SELECT status, COUNT(*) as cnt FROM reconcile_results GROUP BY status").fetchall()
         return {r["status"]: r["cnt"] for r in rows}
+
+    def query_reconcile_results(
+        self,
+        status: Optional[str] = None,
+        session: Optional[str] = None,
+        mark: Optional[str] = None,
+        keyword: Optional[str] = None,
+        limit: Optional[int] = None,
+        sort_by: str = "id",
+        sort_order: str = "asc",
+    ) -> List[ReconcileResult]:
+        sql = "SELECT * FROM reconcile_results"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if session:
+            conditions.append("session = ?")
+            params.append(session)
+        if mark:
+            conditions.append("manual_mark = ?")
+            params.append(mark)
+        if keyword:
+            conditions.append("(name LIKE ? OR phone LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        valid_sort = {"id": "id", "status": "status"}
+        order_col = valid_sort.get(sort_by, "id")
+        order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+        sql += f" ORDER BY {order_col} {order_dir}"
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        return [ReconcileResult(**dict(r)) for r in rows]
+
+    def save_view(self, name: str, filters: str, overwrite: bool = False) -> bool:
+        existing = self.conn.execute("SELECT id FROM saved_views WHERE name=?", (name,)).fetchone()
+        if existing:
+            if not overwrite:
+                return False
+            self.conn.execute(
+                "UPDATE saved_views SET filters=?, updated_at=? WHERE name=?",
+                (filters, self._now(), name),
+            )
+            self.conn.commit()
+            return True
+        self.conn.execute(
+            "INSERT INTO saved_views (name,filters,created_at,updated_at) VALUES (?,?,?,?)",
+            (name, filters, self._now(), self._now()),
+        )
+        self.conn.commit()
+        return True
+
+    def get_view(self, name: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM saved_views WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def list_views(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM saved_views ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_view(self, name: str) -> bool:
+        cur = self.conn.execute("DELETE FROM saved_views WHERE name=?", (name,))
+        self.conn.commit()
+        return cur.rowcount > 0
 
     # ── Import Errors ──────────────────────────────────────────
 

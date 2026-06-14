@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import click
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from .models import (
     EnrollmentRecord,
@@ -14,6 +14,65 @@ from .models import (
 )
 from .storage import Storage
 from .reconcile import reconcile, undo, mark_result, batch_mark
+
+
+VALID_STATUSES = {"normal", "absent", "non_enrolled", "duplicate"}
+
+STATUS_LABELS = {
+    "normal": "正常签到",
+    "absent": "缺席",
+    "non_enrolled": "非报名人员",
+    "duplicate": "重复扫码",
+}
+
+
+def _resolve_filters(
+    status, session, mark, keyword, limit, sort_by, sort_order, view, save_view, overwrite, storage
+) -> Dict[str, Any]:
+    filters: Dict[str, Any] = {}
+    if view:
+        saved = storage.get_view(view)
+        if saved is None:
+            click.echo(f"错误：视图「{view}」不存在", err=True)
+            storage.close()
+            sys.exit(1)
+        view_filters = json.loads(saved["filters"])
+        filters.update(view_filters)
+    cli_overrides: Dict[str, Any] = {}
+    if status is not None:
+        cli_overrides["status"] = status
+    if session is not None:
+        cli_overrides["session"] = session
+    if mark is not None:
+        cli_overrides["mark"] = mark
+    if keyword is not None:
+        cli_overrides["keyword"] = keyword
+    if limit is not None:
+        cli_overrides["limit"] = limit
+    if sort_by is not None:
+        cli_overrides["sort_by"] = sort_by
+    if sort_order is not None:
+        cli_overrides["sort_order"] = sort_order
+    filters.update(cli_overrides)
+    if save_view:
+        filters_to_save = {k: v for k, v in filters.items() if v is not None}
+        saved_json = json.dumps(filters_to_save, ensure_ascii=False)
+        ok = storage.save_view(save_view, saved_json, overwrite=overwrite)
+        if not ok:
+            click.echo(f"错误：视图「{save_view}」已存在，使用 --overwrite 覆盖", err=True)
+            storage.close()
+            sys.exit(1)
+        click.echo(f"[OK] 视图「{save_view}」已保存")
+    return filters
+
+
+def _validate_status(status: Optional[str]) -> Optional[str]:
+    if status is None:
+        return None
+    if status not in VALID_STATUSES:
+        click.echo(f"错误：非法状态「{status}」，可选值：{', '.join(sorted(VALID_STATUSES))}", err=True)
+        sys.exit(1)
+    return status
 
 
 def _get_storage() -> Storage:
@@ -272,17 +331,10 @@ def do_reconcile():
     for r in results:
         status_counts[r.status] = status_counts.get(r.status, 0) + 1
 
-    status_labels = {
-        "normal": "正常签到",
-        "absent": "缺席",
-        "non_enrolled": "非报名人员",
-        "duplicate": "重复扫码",
-    }
-
     click.echo("对账完成：")
     for status in ["normal", "absent", "non_enrolled", "duplicate"]:
         cnt = status_counts.get(status, 0)
-        label = status_labels.get(status, status)
+        label = STATUS_LABELS.get(status, status)
         click.echo(f"  {label}: {cnt}")
 
     storage.close()
@@ -323,6 +375,132 @@ def do_undo():
     storage.close()
 
 
+def _common_filter_options(f):
+    f = click.option("--status", "-s", default=None, help="按状态筛选 (normal/absent/non_enrolled/duplicate)")(f)
+    f = click.option("--session", default=None, help="按场次筛选")(f)
+    f = click.option("--mark", default=None, help="按人工标记筛选")(f)
+    f = click.option("--keyword", "-k", default=None, help="按姓名或手机号关键词筛选")(f)
+    f = click.option("--limit", "-n", type=int, default=None, help="限制返回条数")(f)
+    f = click.option("--sort-by", type=click.Choice(["id", "status"]), default=None, help="排序字段（默认 id）")(f)
+    f = click.option("--sort-order", type=click.Choice(["asc", "desc"]), default=None, help="排序方向（默认 asc）")(f)
+    f = click.option("--view", "-v", default=None, help="使用已保存的视图名加载筛选条件")(f)
+    f = click.option("--save-view", default=None, help="将当前筛选条件保存为命名视图")(f)
+    f = click.option("--overwrite", is_flag=True, default=False, help="覆盖同名视图")(f)
+    return f
+
+
+@main.command("list")
+@_common_filter_options
+def do_list(status, session, mark, keyword, limit, sort_by, sort_order, view, save_view, overwrite):
+    """查看对账结果列表（支持筛选、排序、视图）"""
+    storage = _get_storage()
+    if status is not None:
+        status = _validate_status(status)
+    filters = _resolve_filters(
+        status, session, mark, keyword, limit, sort_by, sort_order, view, save_view, overwrite, storage
+    )
+    results = storage.query_reconcile_results(
+        status=filters.get("status"),
+        session=filters.get("session"),
+        mark=filters.get("mark"),
+        keyword=filters.get("keyword"),
+        limit=filters.get("limit"),
+        sort_by=filters.get("sort_by", "id"),
+        sort_order=filters.get("sort_order", "asc"),
+    )
+
+    if not results:
+        click.echo("暂无匹配的对账结果")
+        storage.close()
+        return
+
+    col_widths = {
+        "id": max(4, max(len(str(r.id)) for r in results)),
+        "name": max(4, max(len(r.name) for r in results)),
+        "phone": max(4, max(len(r.phone or "") for r in results)),
+        "session": max(4, max(len(r.session) for r in results)),
+        "status": max(4, max(len(STATUS_LABELS.get(r.status, r.status)) for r in results)),
+        "mark": max(4, max(len(r.manual_mark or "-") for r in results)),
+        "notes": max(4, max(len(r.notes or "-") for r in results)),
+    }
+
+    header = (
+        f"{'ID':<{col_widths['id']}}  "
+        f"{'姓名':<{col_widths['name']}}  "
+        f"{'手机号':<{col_widths['phone']}}  "
+        f"{'场次':<{col_widths['session']}}  "
+        f"{'状态':<{col_widths['status']}}  "
+        f"{'标记':<{col_widths['mark']}}  "
+        f"{'备注':<{col_widths['notes']}}"
+    )
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for r in results:
+        label = STATUS_LABELS.get(r.status, r.status)
+        row = (
+            f"{str(r.id):<{col_widths['id']}}  "
+            f"{r.name:<{col_widths['name']}}  "
+            f"{r.phone or '':<{col_widths['phone']}}  "
+            f"{r.session:<{col_widths['session']}}  "
+            f"{label:<{col_widths['status']}}  "
+            f"{r.manual_mark or '-':<{col_widths['mark']}}  "
+            f"{r.notes or '-':<{col_widths['notes']}}"
+        )
+        click.echo(row)
+
+    click.echo(f"\n共 {len(results)} 条结果")
+    storage.close()
+
+
+@main.command("view-list")
+def do_view_list():
+    """列出所有已保存的视图"""
+    storage = _get_storage()
+    views = storage.list_views()
+    if not views:
+        click.echo("暂无已保存的视图")
+        storage.close()
+        return
+
+    for v in views:
+        filters = json.loads(v["filters"])
+        desc_parts = []
+        if filters.get("status"):
+            desc_parts.append(f"状态={filters['status']}")
+        if filters.get("session"):
+            desc_parts.append(f"场次={filters['session']}")
+        if filters.get("mark"):
+            desc_parts.append(f"标记={filters['mark']}")
+        if filters.get("keyword"):
+            desc_parts.append(f"关键词={filters['keyword']}")
+        if filters.get("limit"):
+            desc_parts.append(f"限制={filters['limit']}")
+        if filters.get("sort_by"):
+            desc_parts.append(f"排序={filters['sort_by']}")
+        if filters.get("sort_order"):
+            desc_parts.append(f"方向={filters['sort_order']}")
+        desc = ", ".join(desc_parts) if desc_parts else "无筛选条件"
+        click.echo(f"  {v['name']}  ({desc})")
+
+    click.echo(f"\n共 {len(views)} 个视图")
+    storage.close()
+
+
+@main.command("view-delete")
+@click.argument("name")
+def do_view_delete(name: str):
+    """删除已保存的视图"""
+    storage = _get_storage()
+    ok = storage.delete_view(name)
+    if not ok:
+        click.echo(f"错误：视图「{name}」不存在", err=True)
+        storage.close()
+        sys.exit(1)
+    click.echo(f"[OK] 视图「{name}」已删除")
+    storage.close()
+
+
 @main.command("batch-mark")
 @click.argument("csv_file")
 def do_batch_mark(csv_file: str):
@@ -360,29 +538,47 @@ def do_batch_mark(csv_file: str):
 
 @main.command("export")
 @click.option("--output", "-o", default="reconcile_result.csv", help="输出文件路径")
-def do_export(output: str):
-    """导出对账结果为 CSV"""
+@click.option("--status", "-s", default=None, help="按状态筛选")
+@click.option("--session", default=None, help="按场次筛选")
+@click.option("--mark", default=None, help="按人工标记筛选")
+@click.option("--keyword", "-k", default=None, help="按姓名或手机号关键词筛选")
+@click.option("--limit", "-n", type=int, default=None, help="限制导出条数")
+@click.option("--sort-by", type=click.Choice(["id", "status"]), default=None, help="排序字段")
+@click.option("--sort-order", type=click.Choice(["asc", "desc"]), default=None, help="排序方向")
+@click.option("--view", "-v", default=None, help="使用已保存的视图名加载筛选条件")
+def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order, view):
+    """导出对账结果为 CSV（支持筛选）"""
     storage = _get_storage()
-    results = storage.get_all_reconcile_results()
+    if status is not None:
+        status = _validate_status(status)
+    filters = _resolve_filters(
+        status, session, mark, keyword, limit, sort_by, sort_order, view, None, False, storage
+    )
+    has_filter = any(filters.get(k) for k in ("status", "session", "mark", "keyword"))
+    if has_filter:
+        results = storage.query_reconcile_results(
+            status=filters.get("status"),
+            session=filters.get("session"),
+            mark=filters.get("mark"),
+            keyword=filters.get("keyword"),
+            limit=filters.get("limit"),
+            sort_by=filters.get("sort_by", "id"),
+            sort_order=filters.get("sort_order", "asc"),
+        )
+    else:
+        results = storage.get_all_reconcile_results()
 
     if not results:
         click.echo("错误：暂无对账结果，请先执行 reconcile", err=True)
         storage.close()
         sys.exit(1)
 
-    status_labels = {
-        "normal": "正常签到",
-        "absent": "缺席",
-        "non_enrolled": "非报名人员",
-        "duplicate": "重复扫码",
-    }
-
     abs_output = os.path.abspath(output)
     with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["ID", "姓名", "手机号", "场次", "状态", "标记", "备注"])
         for r in results:
-            label = status_labels.get(r.status, r.status)
+            label = STATUS_LABELS.get(r.status, r.status)
             writer.writerow([
                 r.id,
                 r.name,
@@ -399,9 +595,9 @@ def do_export(output: str):
 
     click.echo(f"[OK] 已导出 {len(results)} 条对账结果到 {abs_output}")
     click.echo("汇总：")
-    for status in ["normal", "absent", "non_enrolled", "duplicate"]:
-        cnt = status_counts.get(status, 0)
-        label = status_labels.get(status, status)
+    for st in ["normal", "absent", "non_enrolled", "duplicate"]:
+        cnt = status_counts.get(st, 0)
+        label = STATUS_LABELS.get(st, st)
         click.echo(f"  {label}: {cnt}")
 
     storage.close()
@@ -418,18 +614,11 @@ def do_status():
     click.echo(f"匹配规则: {stats['rules_count']} 条")
     click.echo(f"对账结果: {stats['result_count']} 条")
 
-    status_labels = {
-        "normal": "正常签到",
-        "absent": "缺席",
-        "non_enrolled": "非报名人员",
-        "duplicate": "重复扫码",
-    }
-
     if stats["status_counts"]:
         for status in ["normal", "absent", "non_enrolled", "duplicate"]:
             cnt = stats["status_counts"].get(status, 0)
             if cnt:
-                label = status_labels.get(status, status)
+                label = STATUS_LABELS.get(status, status)
                 click.echo(f"  - {label}: {cnt}")
 
     click.echo(f"撤销历史: {stats['undo_count']} 步")
