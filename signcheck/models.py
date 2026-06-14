@@ -84,3 +84,28 @@ class SessionRecord:
     description: Optional[str] = None
     created_at: Optional[str] = None
     closed_at: Optional[str] = None
+
+
+@dataclass
+class NotificationRule:
+    id: Optional[int] = None
+    session: str = ""
+    channel: str = ""
+    target: str = ""
+    enabled: int = 1
+    absent_threshold: int = 0
+    extra_config: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
+class NotificationLog:
+    id: Optional[int] = None
+    channel: str = ""
+    target: str = ""
+    session: str = ""
+    status: str = ""
+    message: Optional[str] = None
+    retries: int = 0
+    created_at: Optional[str] = None

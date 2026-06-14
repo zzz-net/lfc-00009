@@ -12,6 +12,8 @@ from .models import (
     UndoAction,
     FieldMapping,
     SessionRecord,
+    NotificationRule,
+    NotificationLog,
 )
 
 def _resolve_db_dir():
@@ -108,6 +110,29 @@ CREATE TABLE IF NOT EXISTS sessions (
     description TEXT,
     created_at TEXT NOT NULL,
     closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notification_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    absent_threshold INTEGER NOT NULL DEFAULT 0,
+    extra_config TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    session TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    retries INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -666,6 +691,8 @@ class Storage:
         "import_errors",
         "saved_views",
         "sessions",
+        "notification_rules",
+        "notification_log",
     ]
 
     def export_all(self) -> Dict[str, Any]:
@@ -710,3 +737,67 @@ class Storage:
             if batch:
                 self.conn.executemany(sql, batch)
         self.conn.commit()
+
+    # ── Notification Rules ────────────────────────────────────
+
+    def add_notification_rule(self, rule: NotificationRule) -> int:
+        now = self._now()
+        cur = self.conn.execute(
+            "INSERT INTO notification_rules (session,channel,target,enabled,absent_threshold,extra_config,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rule.session, rule.channel, rule.target, rule.enabled, rule.absent_threshold, rule.extra_config, now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_notification_rule(self, rule_id: int) -> Optional[NotificationRule]:
+        row = self.conn.execute("SELECT * FROM notification_rules WHERE id=?", (rule_id,)).fetchone()
+        if row is None:
+            return None
+        return NotificationRule(**dict(row))
+
+    def get_all_notification_rules(self) -> List[NotificationRule]:
+        rows = self.conn.execute("SELECT * FROM notification_rules ORDER BY id").fetchall()
+        return [NotificationRule(**dict(r)) for r in rows]
+
+    def get_notification_rules_by_session(self, session: str) -> List[NotificationRule]:
+        rows = self.conn.execute("SELECT * FROM notification_rules WHERE session=? AND enabled=1 ORDER BY id", (session,)).fetchall()
+        return [NotificationRule(**dict(r)) for r in rows]
+
+    def update_notification_rule(self, rule_id: int, **kwargs) -> bool:
+        sets = []
+        vals = []
+        for key in ("session", "channel", "target", "enabled", "absent_threshold", "extra_config"):
+            if key in kwargs:
+                sets.append(f"{key}=?")
+                vals.append(kwargs[key])
+        if not sets:
+            return False
+        sets.append("updated_at=?")
+        vals.append(self._now())
+        vals.append(rule_id)
+        cur = self.conn.execute(f"UPDATE notification_rules SET {','.join(sets)} WHERE id=?", vals)
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_notification_rule(self, rule_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM notification_rules WHERE id=?", (rule_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # ── Notification Log ──────────────────────────────────────
+
+    def add_notification_log(self, log: NotificationLog) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO notification_log (channel,target,session,status,message,retries,created_at) VALUES (?,?,?,?,?,?,?)",
+            (log.channel, log.target, log.session, log.status, log.message, log.retries, self._now()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_notification_logs(self, limit: int = 100, offset: int = 0) -> List[NotificationLog]:
+        rows = self.conn.execute("SELECT * FROM notification_log ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        return [NotificationLog(**dict(r)) for r in rows]
+
+    def get_notification_logs_by_session(self, session: str, limit: int = 100) -> List[NotificationLog]:
+        rows = self.conn.execute("SELECT * FROM notification_log WHERE session=? ORDER BY id DESC LIMIT ?", (session, limit)).fetchall()
+        return [NotificationLog(**dict(r)) for r in rows]
