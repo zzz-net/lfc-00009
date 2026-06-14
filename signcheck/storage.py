@@ -435,6 +435,16 @@ class Storage:
         rows = self.conn.execute("SELECT status, COUNT(*) as cnt FROM reconcile_results GROUP BY status").fetchall()
         return {r["status"]: r["cnt"] for r in rows}
 
+    def count_reconcile_results_by_session_and_status(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT session, status, COUNT(*) as cnt FROM reconcile_results GROUP BY session, status ORDER BY session, status"
+        ).fetchall()
+        return [{"session": r["session"], "status": r["status"], "count": r["cnt"]} for r in rows]
+
+    def get_reconcile_sessions(self) -> List[str]:
+        rows = self.conn.execute("SELECT DISTINCT session FROM reconcile_results ORDER BY session").fetchall()
+        return [r["session"] for r in rows]
+
     def query_reconcile_results(
         self,
         status: Optional[str] = None,

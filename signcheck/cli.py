@@ -4,6 +4,7 @@ import os
 import sys
 import click
 from typing import List, Optional, Dict, Any
+from collections import defaultdict
 
 from .models import (
     EnrollmentRecord,
@@ -14,6 +15,7 @@ from .models import (
 )
 from .storage import Storage
 from .reconcile import reconcile, undo, mark_result, batch_mark
+from . import config as config_module
 
 
 VALID_STATUSES = {"normal", "absent", "non_enrolled", "duplicate"}
@@ -54,6 +56,10 @@ def _resolve_filters(
     if sort_order is not None:
         cli_overrides["sort_order"] = sort_order
     filters.update(cli_overrides)
+    if "sort_by" not in filters or filters["sort_by"] is None:
+        filters["sort_by"] = config_module.get_config("sort_by")
+    if "sort_order" not in filters or filters["sort_order"] is None:
+        filters["sort_order"] = config_module.get_config("sort_order")
     if save_view:
         filters_to_save = {k: v for k, v in filters.items() if v is not None}
         saved_json = json.dumps(filters_to_save, ensure_ascii=False)
@@ -537,7 +543,7 @@ def do_batch_mark(csv_file: str):
 
 
 @main.command("export")
-@click.option("--output", "-o", default="reconcile_result.csv", help="输出文件路径")
+@click.option("--output", "-o", default=None, help="输出文件路径（默认从配置读取）")
 @click.option("--status", "-s", default=None, help="按状态筛选")
 @click.option("--session", default=None, help="按场次筛选")
 @click.option("--mark", default=None, help="按人工标记筛选")
@@ -572,6 +578,9 @@ def do_export(output, status, session, mark, keyword, limit, sort_by, sort_order
         click.echo("错误：暂无对账结果，请先执行 reconcile", err=True)
         storage.close()
         sys.exit(1)
+
+    if output is None:
+        output = config_module.get_config("export_path")
 
     abs_output = os.path.abspath(output)
     with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
@@ -669,6 +678,185 @@ def do_reset():
         click.echo("[OK] 已清空所有数据")
     else:
         click.echo("当前无数据")
+
+
+def _calc_percentage(count: int, total: int) -> str:
+    if total == 0:
+        return "0.00%"
+    return f"{count / total * 100:.2f}%"
+
+
+def _build_stats_rows(results: List[Dict[str, Any]], sessions: List[str]) -> List[Dict[str, Any]]:
+    session_status_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in results:
+        session_status_counts[r["session"]][r["status"]] = r["count"]
+
+    rows = []
+    for session in sessions:
+        counts = session_status_counts.get(session, {})
+        total = sum(counts.values())
+        row = {
+            "session": session,
+            "total": total,
+        }
+        for status in ["normal", "absent", "non_enrolled", "duplicate"]:
+            cnt = counts.get(status, 0)
+            row[status] = cnt
+            row[f"{status}_pct"] = _calc_percentage(cnt, total)
+        rows.append(row)
+    return rows
+
+
+def _print_stats_table(rows: List[Dict[str, Any]], show_global: bool = True):
+    all_statuses = ["normal", "absent", "non_enrolled", "duplicate"]
+
+    if show_global and len(rows) > 1:
+        global_row = {
+            "session": "合计",
+            "total": sum(r["total"] for r in rows),
+        }
+        for status in all_statuses:
+            global_row[status] = sum(r[status] for r in rows)
+        total_all = global_row["total"]
+        for status in all_statuses:
+            global_row[f"{status}_pct"] = _calc_percentage(global_row[status], total_all)
+        display_rows = rows + [global_row]
+    else:
+        display_rows = rows
+
+    col_widths = {
+        "session": max(6, max(len(str(r["session"])) for r in display_rows)),
+        "total": max(6, max(len(str(r["total"])) for r in display_rows)),
+    }
+    for status in all_statuses:
+        label = STATUS_LABELS[status]
+        max_cnt_len = max(len(str(r[status])) for r in display_rows)
+        max_pct_len = max(len(r[f"{status}_pct"]) for r in display_rows)
+        col_widths[status] = max(len(label), max_cnt_len + max_pct_len + 3)
+
+    header = f"{'场次':<{col_widths['session']}}  {'总计':<{col_widths['total']}}"
+    for status in all_statuses:
+        label = STATUS_LABELS[status]
+        header += f"  {label:<{col_widths[status]}}"
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for r in display_rows:
+        line = f"{str(r['session']):<{col_widths['session']}}  {str(r['total']):<{col_widths['total']}}"
+        for status in all_statuses:
+            cnt = r[status]
+            pct = r[f"{status}_pct"]
+            cell = f"{cnt} ({pct})"
+            line += f"  {cell:<{col_widths[status]}}"
+        click.echo(line)
+
+
+@main.command("stats")
+@click.option("--session", default=None, help="按指定场次查看统计")
+@click.option("--export", "-o", default=None, help="导出统计结果为 CSV")
+def do_stats(session: Optional[str], export: Optional[str]):
+    """查看对账结果统计汇总"""
+    storage = _get_storage()
+
+    all_results = storage.count_reconcile_results_by_session_and_status()
+    all_sessions = storage.get_reconcile_sessions()
+
+    if not all_results:
+        click.echo("暂无对账结果，请先执行 reconcile")
+        storage.close()
+        return
+
+    if session is not None:
+        if session not in all_sessions:
+            click.echo(f"错误：场次「{session}」不存在，可用场次：{', '.join(all_sessions)}", err=True)
+            storage.close()
+            sys.exit(1)
+        results = [r for r in all_results if r["session"] == session]
+        sessions = [session]
+    else:
+        results = all_results
+        sessions = all_sessions
+
+    stats_rows = _build_stats_rows(results, sessions)
+
+    if export is None:
+        _print_stats_table(stats_rows, show_global=(session is None and len(sessions) > 1))
+        total_all = sum(r["total"] for r in stats_rows)
+        click.echo(f"\n共 {len(stats_rows)} 场，{total_all} 条记录")
+    else:
+        abs_output = os.path.abspath(export)
+        with open(abs_output, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["场次", "总计", "正常签到", "正常签到占比", "缺席", "缺席占比", "非报名人员", "非报名人员占比", "重复扫码", "重复扫码占比"])
+            for r in stats_rows:
+                writer.writerow([
+                    r["session"],
+                    r["total"],
+                    r["normal"],
+                    r["normal_pct"],
+                    r["absent"],
+                    r["absent_pct"],
+                    r["non_enrolled"],
+                    r["non_enrolled_pct"],
+                    r["duplicate"],
+                    r["duplicate_pct"],
+                ])
+            if session is None and len(stats_rows) > 1:
+                total_all = sum(r["total"] for r in stats_rows)
+                writer.writerow([
+                    "合计",
+                    total_all,
+                    sum(r["normal"] for r in stats_rows),
+                    _calc_percentage(sum(r["normal"] for r in stats_rows), total_all),
+                    sum(r["absent"] for r in stats_rows),
+                    _calc_percentage(sum(r["absent"] for r in stats_rows), total_all),
+                    sum(r["non_enrolled"] for r in stats_rows),
+                    _calc_percentage(sum(r["non_enrolled"] for r in stats_rows), total_all),
+                    sum(r["duplicate"] for r in stats_rows),
+                    _calc_percentage(sum(r["duplicate"] for r in stats_rows), total_all),
+                ])
+        click.echo(f"[OK] 已导出 {len(stats_rows)} 场统计到 {abs_output}")
+
+    storage.close()
+
+
+@main.group("config")
+def config_group():
+    """管理 CLI 配置偏好"""
+    pass
+
+
+@config_group.command("show")
+def config_show():
+    """显示当前配置"""
+    cfg = config_module.load_config()
+    click.echo("当前配置：")
+    for key in sorted(cfg.keys()):
+        click.echo(f"  {key}: {cfg[key]}")
+
+
+@config_group.command("set")
+@click.argument("key")
+@click.argument("value")
+def config_set(key: str, value: str):
+    """设置单项配置"""
+    try:
+        cfg = config_module.set_config(key, value)
+        click.echo(f"[OK] 已设置 {key} = {cfg[key]}")
+    except ValueError as e:
+        click.echo(f"错误：{e}", err=True)
+        sys.exit(1)
+
+
+@config_group.command("reset")
+@click.confirmation_option(prompt="确定要恢复出厂默认配置吗？")
+def config_reset():
+    """恢复出厂默认配置"""
+    cfg = config_module.reset_config()
+    click.echo("[OK] 已恢复默认配置")
+    click.echo("当前配置：")
+    for key in sorted(cfg.keys()):
+        click.echo(f"  {key}: {cfg[key]}")
 
 
 if __name__ == "__main__":
