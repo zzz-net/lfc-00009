@@ -48,6 +48,8 @@ from .reconcile import mark_result as do_mark_result
 from .reconcile import reconcile as do_reconcile
 from .reconcile import undo as do_undo
 from .storage import Storage
+from .notifier import notify_after_reconcile
+from .models import NotificationRule
 
 # ──────────────────────────────────────────────────────────────────
 # Configuration
@@ -146,6 +148,24 @@ class BatchMarkItem(BaseModel):
 
 class BatchMarkRequest(BaseModel):
     items: List[BatchMarkItem]
+
+
+class NotificationRuleCreate(BaseModel):
+    session: str
+    channel: str = Field(pattern="^(email|webhook)$")
+    target: str
+    enabled: int = Field(default=1, ge=0, le=1)
+    absent_threshold: int = Field(default=0, ge=0)
+    extra_config: Optional[str] = None
+
+
+class NotificationRuleUpdate(BaseModel):
+    session: Optional[str] = None
+    channel: Optional[str] = Field(default=None, pattern="^(email|webhook)$")
+    target: Optional[str] = None
+    enabled: Optional[int] = Field(default=None, ge=0, le=1)
+    absent_threshold: Optional[int] = Field(default=None, ge=0)
+    extra_config: Optional[str] = None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -815,6 +835,9 @@ def reconcile_endpoint(
                 for st, cnt in breakdown.items()
             } for sess, breakdown in session_breakdown.items()
         },
+        "notifications": notify_after_reconcile(
+            sorted(all_sessions_set), results, storage,
+        ),
     })
 
 
@@ -830,8 +853,8 @@ def list_results(
     keyword: Optional[str] = Query(default=None, description="姓名/手机号关键词"),
     limit: Optional[int] = Query(default=None, ge=1),
     offset: int = Query(default=0, ge=0),
-    sort_by: str = Query(default="id", regex="^(id|status|session|name)$"),
-    sort_order: str = Query(default="asc", regex="^(asc|desc)$"),
+    sort_by: str = Query(default="id", pattern="^(id|status|session|name)$"),
+    sort_order: str = Query(default="asc", pattern="^(asc|desc)$"),
     storage: Storage = Depends(get_storage),
     _: None = Depends(verify_token),
 ):
@@ -996,7 +1019,7 @@ def stats_endpoint(
 
 @app.get("/api/v1/export", summary="导出对账报告（支持 csv/json/xlsx/html）")
 def export_endpoint(
-    fmt: str = Query(default="json", regex="^(csv|json|xlsx|html)$"),
+    fmt: str = Query(default="json", pattern="^(csv|json|xlsx|html)$"),
     status: Optional[str] = Query(default=None),
     session: Optional[str] = Query(default=None),
     mark: Optional[str] = Query(default=None),
@@ -1264,6 +1287,147 @@ def token_info(_: None = Depends(verify_token)):
         "header": "Authorization: Bearer <token>",
         "token_length": len(DEFAULT_API_TOKEN),
         "note": "生产环境请通过 SIGNCHECK_API_TOKEN 环境变量设置强随机 token",
+    })
+
+
+# ──────────────────────────────────────────────────────────────────
+# 9. 通知规则管理
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/notify/rules", summary="列出所有通知规则")
+def list_notify_rules(
+    storage: Storage = Depends(get_storage),
+    _: None = Depends(verify_token),
+):
+    rules = storage.get_all_notification_rules()
+    return ApiResponse(data={
+        "count": len(rules),
+        "rules": [
+            {
+                "id": r.id,
+                "session": r.session,
+                "channel": r.channel,
+                "target": r.target,
+                "enabled": bool(r.enabled),
+                "absent_threshold": r.absent_threshold,
+                "extra_config": r.extra_config,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in rules
+        ],
+    })
+
+
+@app.post("/api/v1/notify/rules", summary="创建通知规则")
+def create_notify_rule(
+    req: NotificationRuleCreate,
+    storage: Storage = Depends(get_storage),
+    _: None = Depends(verify_token),
+):
+    rule = NotificationRule(
+        session=req.session,
+        channel=req.channel,
+        target=req.target,
+        enabled=req.enabled,
+        absent_threshold=req.absent_threshold,
+        extra_config=req.extra_config,
+    )
+    rule_id = storage.add_notification_rule(rule)
+    created = storage.get_notification_rule(rule_id)
+    return ApiResponse(data={
+        "id": rule_id,
+        "rule": {
+            "id": created.id,
+            "session": created.session,
+            "channel": created.channel,
+            "target": created.target,
+            "enabled": bool(created.enabled),
+            "absent_threshold": created.absent_threshold,
+            "extra_config": created.extra_config,
+            "created_at": created.created_at,
+            "updated_at": created.updated_at,
+        },
+    })
+
+
+@app.put("/api/v1/notify/rules/{rule_id}", summary="更新通知规则")
+def update_notify_rule(
+    rule_id: int,
+    req: NotificationRuleUpdate,
+    storage: Storage = Depends(get_storage),
+    _: None = Depends(verify_token),
+):
+    existing = storage.get_notification_rule(rule_id)
+    if existing is None:
+        raise HTTPException(404, f"通知规则 #{rule_id} 不存在")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "至少提供一项更新字段")
+    ok = storage.update_notification_rule(rule_id, **updates)
+    if not ok:
+        raise HTTPException(500, "更新失败")
+    updated = storage.get_notification_rule(rule_id)
+    return ApiResponse(data={
+        "id": rule_id,
+        "rule": {
+            "id": updated.id,
+            "session": updated.session,
+            "channel": updated.channel,
+            "target": updated.target,
+            "enabled": bool(updated.enabled),
+            "absent_threshold": updated.absent_threshold,
+            "extra_config": updated.extra_config,
+            "created_at": updated.created_at,
+            "updated_at": updated.updated_at,
+        },
+    })
+
+
+@app.delete("/api/v1/notify/rules/{rule_id}", summary="删除通知规则")
+def delete_notify_rule(
+    rule_id: int,
+    storage: Storage = Depends(get_storage),
+    _: None = Depends(verify_token),
+):
+    existing = storage.get_notification_rule(rule_id)
+    if existing is None:
+        raise HTTPException(404, f"通知规则 #{rule_id} 不存在")
+    storage.delete_notification_rule(rule_id)
+    return ApiResponse(data={"deleted": rule_id})
+
+
+# ──────────────────────────────────────────────────────────────────
+# 10. 通知日志查询
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/notify/logs", summary="查询通知发送日志")
+def list_notify_logs(
+    session: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    storage: Storage = Depends(get_storage),
+    _: None = Depends(verify_token),
+):
+    if session:
+        logs = storage.get_notification_logs_by_session(session, limit=limit)
+    else:
+        logs = storage.get_notification_logs(limit=limit, offset=offset)
+    return ApiResponse(data={
+        "count": len(logs),
+        "logs": [
+            {
+                "id": l.id,
+                "channel": l.channel,
+                "target": l.target,
+                "session": l.session,
+                "status": l.status,
+                "message": l.message,
+                "retries": l.retries,
+                "created_at": l.created_at,
+            }
+            for l in logs
+        ],
     })
 
 
